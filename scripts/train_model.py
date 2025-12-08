@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+Training script for Elo prediction models.
+"""
+
+import os
+import sys
+import pickle
+import argparse
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.data.dataset import create_data_loaders
+from src.models.transformer import TransformerEncoder
+from src.models.lstm import LSTMEloPredictor
+from src.train import Trainer
+from src.utils import save_experiment_config
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def load_dataset(data_dir: str = "data/processed"):
+    """Load preprocessed dataset splits."""
+    splits_path = os.path.join(data_dir, "dataset_splits.pkl")
+
+    if not os.path.exists(splits_path):
+        logger.error(f"Dataset splits not found at {splits_path}")
+        logger.error("Run scripts/preprocess_data.py first")
+        return None
+
+    with open(splits_path, 'rb') as f:
+        splits = pickle.load(f)
+
+    return splits['train'], splits['val'], splits['test']
+
+
+def main():
+    """Main training pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Train Elo prediction model"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["transformer", "lstm"],
+        default="transformer",
+        help="Model architecture to train",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+        help="Number of epochs",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate",
+    )
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=128,
+        help="Embedding dimension",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["cpu", "cuda"],
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to train on",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data/processed",
+        help="Directory with preprocessed data",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="experiments",
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        default=True,
+        help="Use early stopping",
+    )
+
+    args = parser.parse_args()
+
+    # Set random seed
+    torch.manual_seed(args.seed)
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load dataset
+    logger.info("Loading dataset...")
+    train_games, val_games, test_games = load_dataset(args.data_dir)
+
+    if train_games is None:
+        return
+
+    logger.info(f"Train: {len(train_games)}, Val: {len(val_games)}, Test: {len(test_games)}")
+
+    # Create dataloaders
+    logger.info("Creating dataloaders...")
+    train_loader, val_loader, test_loader, encoder = create_data_loaders(
+        train_games, val_games, test_games,
+        batch_size=args.batch_size,
+    )
+
+    # Create model
+    logger.info(f"Creating {args.model} model...")
+    device = torch.device(args.device)
+
+    if args.model == "transformer":
+        model = TransformerEncoder(
+            embedding_dim=args.embedding_dim,
+            dropout=args.dropout,
+            num_layers=4,
+            num_heads=8,
+        )
+    else:  # lstm
+        model = LSTMEloPredictor(
+            embedding_dim=args.embedding_dim,
+            lstm_hidden_dim=256,
+            dropout=args.dropout,
+        )
+
+    model = model.to(device)
+
+    # Optimizer and loss
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+
+    # Create trainer
+    trainer = Trainer(
+        model, optimizer, criterion, device,
+        encoder=encoder, scheduler=scheduler
+    )
+
+    # Save config
+    config = {
+        "model": args.model,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "dropout": args.dropout,
+        "embedding_dim": args.embedding_dim,
+        "seed": args.seed,
+        "device": str(device),
+    }
+    config_path = save_experiment_config(config, args.output_dir)
+    logger.info(f"Saved config to {config_path}")
+
+    # Train
+    logger.info("Starting training...")
+    log_file = os.path.join(args.output_dir, "training_log.txt")
+
+    history = trainer.fit(
+        train_loader, val_loader,
+        num_epochs=args.epochs,
+        early_stopping=args.early_stopping,
+        patience=5,
+        checkpoint_dir=os.path.join(args.output_dir, "checkpoints"),
+        model_name=args.model,
+        log_file=log_file,
+    )
+
+    # Evaluate on test set
+    logger.info("Evaluating on test set...")
+    test_metrics = trainer.test(test_loader)
+    logger.info(f"Test MAE: {test_metrics['mae']:.6f}")
+    if 'mae_elo' in test_metrics:
+        logger.info(f"Test MAE (Elo): {test_metrics['mae_elo']:.2f}")
+
+    logger.info("\nTraining complete!")
+
+
+if __name__ == "__main__":
+    main()
