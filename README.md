@@ -110,153 +110,31 @@ python scripts/preprocess_data.py --output custom_data/
 
 ### 3. Train Model
 
-#### Platform-Specific Training Commands
-
-**macOS (Apple Silicon - M1/M2/M3)**
-
 ```bash
 # Transformer (recommended)
-PYTORCH_ENABLE_MPS_FALLBACK=1 python scripts/train_model.py \
-  --model transformer \
-  --epochs 30 \
-  --batch-size 32
+python scripts/train_model.py --model transformer --epochs 30 --batch-size 32
 
 # LSTM baseline
-PYTORCH_ENABLE_MPS_FALLBACK=1 python scripts/train_model.py \
-  --model lstm \
-  --epochs 30 \
-  --batch-size 32
+python scripts/train_model.py --model lstm --epochs 30 --batch-size 32
 ```
 
-**Windows/Linux (NVIDIA GPU)**
+**Note for Apple Silicon (M1/M2/M3):** Add `PYTORCH_ENABLE_MPS_FALLBACK=1` before the command.
 
-```bash
-# Transformer (recommended)
-python scripts/train_model.py \
-  --model transformer \
-  --epochs 30 \
-  --batch-size 32 \
-  --device cuda
-
-# LSTM baseline
-python scripts/train_model.py \
-  --model lstm \
-  --epochs 30 \
-  --batch-size 32 \
-  --device cuda
-```
-
-**Any Platform (CPU-only)**
-
-```bash
-# Transformer (slower but works everywhere)
-python scripts/train_model.py \
-  --model transformer \
-  --epochs 20 \
-  --batch-size 16 \
-  --device cpu
-
-# LSTM baseline (more CPU-friendly)
-python scripts/train_model.py \
-  --model lstm \
-  --epochs 20 \
-  --batch-size 32 \
-  --device cpu
-```
-
-#### Expected Training Times (Full Dataset: ~121K games)
-
-| Setup | Transformer | LSTM |
-|-------|-------------|------|
-| **M2 Pro (MPS)** | ~85 min/epoch<br>30 epochs: ~42 hours | ~4-5 hours/epoch<br>30 epochs: ~5 days |
-| **NVIDIA GPU (CUDA)** | ~60-90 min/epoch<br>30 epochs: ~30-45 hours | ~3-4 hours/epoch<br>30 epochs: ~4 days |
-| **8-core CPU** | ~8-10 hours/epoch<br>20 epochs: ~7 days | ~3-5 hours/epoch<br>20 epochs: ~4 days |
-
-**Recommendation:** Start with 10-20 epochs to see convergence, then decide if more epochs are needed based on validation loss curve.
-
-#### Training Options
-
-```bash
-python scripts/train_model.py --help
-```
-
-Key arguments:
+**Key Options:**
 - `--model`: "transformer" or "lstm"
+- `--epochs`: Number of epochs (default: 50)
 - `--batch-size`: Batch size (default: 32)
-- `--epochs`: Number of training epochs (default: 50)
-- `--lr`: Learning rate (default: 1e-3)
-- `--dropout`: Dropout rate (default: 0.1)
-- `--embedding-dim`: Embedding dimension (default: 128)
 - `--device`: "cuda", "cpu", or auto-detect
-- `--output-dir`: Directory for results (default: experiments/)
-- `--early-stopping`: Enable early stopping (default: True)
 
-### 4. Verify Training Pipeline (Quick Test)
+### 4. Quick Pipeline Test
 
-Before running full training, verify that both models work on your system:
-
-#### macOS / Linux
+Verify both models work (~2 minutes):
 
 ```bash
-# Quick pipeline test (~2 minutes total for both models)
-PYTORCH_ENABLE_MPS_FALLBACK=1 python scripts/test_pipeline.py
-```
-
-#### Windows (Command Prompt)
-
-```cmd
-# Quick pipeline test (~2 minutes total for both models)
 python scripts/test_pipeline.py
 ```
 
-#### Windows (PowerShell)
-
-```powershell
-# Quick pipeline test (~2 minutes total for both models)
-$env:PYTORCH_ENABLE_MPS_FALLBACK="1"
-python scripts/test_pipeline.py
-```
-
-**What this tests:**
-- Data loading from preprocessed files
-- Transformer model training (2 epochs on 500 games)
-- LSTM model training (2 epochs on 500 games)
-- Forward/backward passes
-- Validation loop
-- MPS (Apple Silicon) / CUDA (NVIDIA) / CPU compatibility
-
-**Expected output:**
-```
-============================================================
-PIPELINE TEST SUMMARY
-============================================================
-
-✓ Transformer: PASSED
-  - Final validation MAE: ~100 Elo
-  - Training completed without errors
-
-✓ LSTM: PASSED
-  - Final validation MAE: ~100 Elo
-  - Training completed without errors
-
-============================================================
-✓✓✓ ALL PIPELINE TESTS PASSED ✓✓✓
-============================================================
-```
-
-**Timing:**
-- **macOS M2 Pro (MPS GPU):** ~1-2 minutes total
-- **Windows/Linux (CUDA GPU):** ~1-2 minutes total
-- **CPU-only:** ~5-10 minutes total
-
-**Platform Notes:**
-
-| Platform | Accelerator | Notes |
-|----------|-------------|-------|
-| macOS (Apple Silicon) | MPS | Set `PYTORCH_ENABLE_MPS_FALLBACK=1` for transformer attention |
-| Windows/Linux (NVIDIA GPU) | CUDA | Auto-detected if available |
-| Windows/Linux (AMD GPU) | ROCm | May require specific PyTorch build |
-| Any (CPU-only) | CPU | Works everywhere, ~5x slower |
+**Apple Silicon:** Add `PYTORCH_ENABLE_MPS_FALLBACK=1` before the command.
 
 ### 5. Run Unit Tests
 
@@ -394,93 +272,12 @@ model.load_state_dict(torch.load("models/best_checkpoint.pt"))
 predictions, _ = model(sequences, lengths)
 ```
 
-## Computational Requirements
+## Requirements
 
-- **Minimum:** CPU only (slow but functional)
-- **Recommended:** GPU with 4GB+ VRAM (NVIDIA CUDA or Apple MPS)
-- **Available:** ORCA cluster with 192GB VRAM, 64 CPU cores, 576GB RAM
-
-The project was tested on similar scales and scales down gracefully if needed.
-
-## Cross-Platform Compatibility
-
-### Tested Platforms
-
-| Platform | Hardware | Status | Notes |
-|----------|----------|--------|-------|
-| macOS (Apple Silicon) | M2 Pro, 16GB RAM | ✅ Fully tested | Requires `PYTORCH_ENABLE_MPS_FALLBACK=1` |
-| Windows (NVIDIA GPU) | RTX series | ✅ Compatible | Auto-detects CUDA |
-| Linux (NVIDIA GPU) | Various | ✅ Compatible | Auto-detects CUDA |
-| Windows/Linux (CPU) | 8+ cores | ✅ Compatible | Slower but works |
-| macOS (Intel) | Intel CPU | ✅ Compatible | CPU-only mode |
-
-### Troubleshooting
-
-**Issue: "MPS backend not available" on macOS**
-```bash
-# Your Mac doesn't have Apple Silicon, use CPU instead
-python scripts/train_model.py --model transformer --device cpu
-```
-
-**Issue: "CUDA not available" on Windows/Linux with NVIDIA GPU**
-```bash
-# Check if PyTorch sees your GPU
-python -c "import torch; print(torch.cuda.is_available())"
-
-# If False, reinstall PyTorch with CUDA support:
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-**Issue: "RuntimeError: mat1 and mat2 shapes cannot be multiplied"**
-- This was fixed in the current version. Make sure you have the latest code.
-- If you cloned earlier, do `git pull` to get the fixes.
-
-**Issue: Training is very slow**
-```bash
-# Check which device is being used
-# Should show "mps", "cuda", or "cpu"
-
-# For Apple Silicon, make sure MPS is enabled:
-python -c "import torch; print(torch.backends.mps.is_available())"
-
-# For NVIDIA, check CUDA:
-python -c "import torch; print(torch.cuda.is_available())"
-```
-
-**Issue: Out of memory errors**
-```bash
-# Reduce batch size
-python scripts/train_model.py --model transformer --batch-size 16
-
-# Or use smaller model on CPU
-python scripts/train_model.py --model lstm --batch-size 8 --device cpu
-```
-
-### Windows-Specific Notes
-
-- **Environment Variables:** Use PowerShell syntax for setting env vars:
-  ```powershell
-  $env:PYTORCH_ENABLE_MPS_FALLBACK="1"
-  ```
-
-- **Path Separators:** Python handles this automatically, no changes needed
-
-- **Virtual Environment Activation:**
-  ```cmd
-  # Command Prompt
-  venv\Scripts\activate
-
-  # PowerShell
-  venv\Scripts\Activate.ps1
-  ```
-
-### Performance Expectations
-
-The models work identically across platforms. Only the speed differs based on available hardware acceleration:
-
-- **GPU (MPS/CUDA):** Fast training (~1-2 hours/epoch for Transformer)
-- **CPU:** Slower but reliable (~8-10 hours/epoch for Transformer)
-- **Results:** Same model quality regardless of platform
+- Python 3.8+
+- GPU recommended (NVIDIA CUDA or Apple MPS) but CPU works
+- ~2GB disk space for processed data
+- 4GB+ RAM (16GB recommended)
 
 ## References
 
