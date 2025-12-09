@@ -69,9 +69,9 @@ class ChessEloDataset(Dataset):
             normalized_elo = float(target_elo)
 
         return {
-            'sequence': sequence,
+            'sequence': sequence.float(),  # Ensure float32 for MPS compatibility
             'length': length,
-            'elo': normalized_elo,
+            'elo': torch.tensor(normalized_elo, dtype=torch.float32),
             'white_elo': float(white_elo),
             'black_elo': float(black_elo),
             'result': result,
