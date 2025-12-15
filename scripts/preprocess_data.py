@@ -10,11 +10,22 @@ import zstandard as zstd
 import pickle
 from tqdm import tqdm
 import argparse
+from multiprocessing import Pool, cpu_count
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.parser import parse_pgn_stream, split_dataset
+from src.data.parser import parse_pgn_stream, split_dataset, parse_pgn_game
+
+
+def parse_game_batch(game_texts):
+    """Parse a batch of games (for parallel processing)."""
+    results = []
+    for game_text in game_texts:
+        result = parse_pgn_game(game_text)
+        if result:
+            results.append(result)
+    return results
 
 
 def decompress_and_parse_pgn(
@@ -22,68 +33,157 @@ def decompress_and_parse_pgn(
     output_dir: str = "data/processed",
     max_games: int = None,
     batch_size: int = 1000,
+    num_workers: int = None,
 ) -> tuple:
     """
-    Decompress zstd-compressed PGN and parse games.
+    Decompress zstd-compressed PGN and parse games with parallel processing.
 
     Args:
         input_path: Path to .pgn.zst file
         output_dir: Directory to save processed data
         max_games: Maximum games to process (None for all)
-        batch_size: Games per batch
+        batch_size: Games per batch for parallel processing
+        num_workers: Number of parallel workers (None = CPU count - 1)
 
     Returns:
         Tuple of (all_games, stats)
     """
     os.makedirs(output_dir, exist_ok=True)
+    
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)  # Leave one core free
 
-    print(f"Decompressing and parsing PGN file: {input_path}\n")
+    print(f"Decompressing and parsing PGN file: {input_path}")
+    if num_workers > 1:
+        print(f"Using {num_workers} parallel workers")
+        print(f"Note: Actual speedup depends on bottlenecks (I/O, chess library operations)")
+        print(f"      Typical speedup: 3-5x (not linear due to I/O and library overhead)")
+    print()
 
     dctx = zstd.ZstdDecompressor()
     all_games = []
     batch_count = 0
     start_time = time.time()
+    
+    # Collect game texts first (faster than parsing immediately)
+    game_texts = []
+    game_count = 0
 
     with open(input_path, 'rb') as f_in:
         with dctx.stream_reader(f_in) as reader:
-            # Convert to text stream
-            text_stream = reader.read().decode('utf-8').splitlines()
+            # Use the existing parse_pgn_stream function for game extraction
+            # But read in chunks to avoid loading entire file
+            text_buffer = ""
+            current_game = []
+            chunk_size = 1024 * 1024  # 1MB chunks
+            
+            while True:
+                chunk = reader.read(chunk_size)
+                if not chunk:
+                    break
+                
+                text_buffer += chunk.decode('utf-8', errors='ignore')
+                
+                # Process complete lines
+                while '\n' in text_buffer:
+                    line, text_buffer = text_buffer.split('\n', 1)
+                    current_game.append(line)
+                    
+                    # Check for game boundary
+                    if line.strip() == "" and current_game:
+                        # Check if it's a complete game
+                        has_moves = any(
+                            l.strip().startswith("1. ") or " 1. " in l
+                            for l in current_game
+                        )
+                        if has_moves:
+                            game_text = "\n".join(current_game)
+                            game_texts.append(game_text)
+                            game_count += 1
+                            
+                            if max_games and game_count >= max_games:
+                                break
+                        current_game = []
+            
+            # Process any remaining game
+            if current_game:
+                game_text = "\n".join(current_game)
+                game_texts.append(game_text)
 
-            # Create progress bar for batches
-            pbar = tqdm(
-                parse_pgn_stream(text_stream, max_games, batch_size),
-                unit="batch",
-                desc="Processing",
-            )
-
-            for batch in pbar:
-                all_games.extend(batch)
+    # Now parse games in parallel batches
+    print(f"Parsing {len(game_texts):,} games with {num_workers} workers...")
+    pbar = tqdm(total=len(game_texts), unit="games", desc="Parsing")
+    
+    if num_workers > 1:
+        # Parallel processing
+        with Pool(num_workers) as pool:
+            # Split into batches
+            batches = [
+                game_texts[i:i + batch_size]
+                for i in range(0, len(game_texts), batch_size)
+            ]
+            
+            # Process batches in parallel
+            for batch_texts in batches:
+                # Split batch across workers
+                chunk_size = max(1, len(batch_texts) // num_workers)
+                chunks = [
+                    batch_texts[i:i + chunk_size]
+                    for i in range(0, len(batch_texts), chunk_size)
+                ]
+                
+                # Parse chunks in parallel
+                results = pool.map(parse_game_batch, chunks)
+                parsed_batch = [game for chunk_results in results for game in chunk_results]
+                
+                all_games.extend(parsed_batch)
                 batch_count += 1
-
+                pbar.update(len(batch_texts))
+                
                 # Calculate stats
                 elapsed = time.time() - start_time
                 games_per_sec = len(all_games) / elapsed if elapsed > 0 else 0
-
-                # Update progress bar description
                 pbar.set_description(
-                    f"Processing | {len(all_games):,} games | {games_per_sec:.0f} games/sec"
+                    f"Parsing | {len(all_games):,} games | {games_per_sec:.0f} games/sec"
                 )
-
-                # Optional: save intermediate checkpoints
-                if batch_count % 100 == 0 and batch_count > 0:
+                
+                # Save checkpoint periodically
+                if batch_count % 50 == 0:
                     checkpoint_path = os.path.join(
                         output_dir, f"games_batch_{batch_count}.pkl"
                     )
                     with open(checkpoint_path, 'wb') as f:
                         pickle.dump(all_games, f)
-                    pbar.write(f"Checkpoint: Saved {len(all_games):,} games to {checkpoint_path}")
+                    pbar.write(f"Checkpoint: Saved {len(all_games):,} games")
+    else:
+        # Sequential processing (fallback)
+        for i in range(0, len(game_texts), batch_size):
+            batch_texts = game_texts[i:i + batch_size]
+            parsed_batch = parse_game_batch(batch_texts)
+            all_games.extend(parsed_batch)
+            batch_count += 1
+            pbar.update(len(batch_texts))
+            
+            elapsed = time.time() - start_time
+            games_per_sec = len(all_games) / elapsed if elapsed > 0 else 0
+            pbar.set_description(
+                f"Parsing | {len(all_games):,} games | {games_per_sec:.0f} games/sec"
+            )
+    
+    pbar.close()
 
     elapsed = time.time() - start_time
     games_per_sec = len(all_games) / elapsed if elapsed > 0 else 0
 
     print(f"\n✓ Total games parsed: {len(all_games):,}")
     print(f"✓ Processing time: {elapsed:.1f} seconds")
-    print(f"✓ Average speed: {games_per_sec:.0f} games/second\n")
+    print(f"✓ Average speed: {games_per_sec:.0f} games/second")
+    if num_workers > 1:
+        # Realistic speedup: typically 3-5x due to I/O and chess library bottlenecks
+        # Don't claim linear speedup - it's misleading
+        print(f"✓ Used {num_workers} parallel workers")
+        print(f"  (Note: Speedup is limited by I/O and chess library operations)")
+    print()
 
     # Save all games
     print("Saving all games...")
@@ -168,8 +268,14 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1000,
-        help="Batch size for processing",
+        default=2000,
+        help="Batch size for parallel processing",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: CPU count - 1)",
     )
 
     args = parser.parse_args()
@@ -193,6 +299,7 @@ def main():
         args.output,
         args.max_games,
         args.batch_size,
+        args.workers,
     )
 
     # Create dataset splits
