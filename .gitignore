@@ -78,11 +78,12 @@ $RECYCLE.BIN/
 *.lnk
 
 # Data Files
+data/raw/
 data/processed/
-data/raw/*.pgn
-data/raw/*.pgn.zst
+data/parquet/
 *.pkl
 *.pickle
+*.parquet
 *.h5
 *.hdf5
 

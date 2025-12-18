@@ -49,7 +49,7 @@ def decompress_and_parse_pgn(
         Tuple of (all_games, stats)
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
     if num_workers is None:
         num_workers = max(1, cpu_count() - 1)  # Leave one core free
 
@@ -88,7 +88,7 @@ def decompress_and_parse_pgn(
                 while '\n' in text_buffer:
                     line, text_buffer = text_buffer.split('\n', 1)
                     current_game.append(line)
-                    
+
                     # Check for game boundary
                     if line.strip() == "" and current_game:
                         # Check if it's a complete game
@@ -100,10 +100,10 @@ def decompress_and_parse_pgn(
                             game_text = "\n".join(current_game)
                             game_texts.append(game_text)
                             game_count += 1
+                            current_game = []  # Only reset after saving complete game
                             
                             if max_games and game_count >= max_games:
                                 break
-                        current_game = []
             
             # Process any remaining game
             if current_game:
@@ -139,14 +139,14 @@ def decompress_and_parse_pgn(
                 all_games.extend(parsed_batch)
                 batch_count += 1
                 pbar.update(len(batch_texts))
-                
+
                 # Calculate stats
                 elapsed = time.time() - start_time
                 games_per_sec = len(all_games) / elapsed if elapsed > 0 else 0
                 pbar.set_description(
                     f"Parsing | {len(all_games):,} games | {games_per_sec:.0f} games/sec"
                 )
-                
+
                 # Save checkpoint periodically
                 if batch_count % 50 == 0:
                     checkpoint_path = os.path.join(

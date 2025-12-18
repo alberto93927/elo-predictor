@@ -53,38 +53,50 @@ def write_games_to_parquet(
     output_path: Path,
     encoder: FENEncoder,
     use_white_elo: bool = True,
-    batch_size: int = 500,  # Reduced to avoid OOM when converting to lists
-    write_batch_size: int = 500,  # Write to Parquet in smaller chunks
+    batch_size: int = 4000,  # Moderately large batch for faster writes without stalling
 ):
     """
-    Write games directly to Parquet format using incremental writing.
-    This avoids loading all games into memory at once.
+    Write games directly to Parquet format using optimized incremental writing.
+    Optimizations:
+    - Uses numpy arrays directly (no .tolist() conversion)
+    - Larger batches for better write performance
+    - Pre-allocated arrays where possible
 
     Args:
         games: List of (fen_sequence, white_elo, black_elo, result) tuples
         output_path: Path to save Parquet file
         encoder: FENEncoder instance
         use_white_elo: If True use white's Elo, else use black's
-        batch_size: Number of games to process at once
-        write_batch_size: Number of games to accumulate before writing to Parquet
+        batch_size: Number of games to process and write at once (default: 2000)
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Writing {len(games):,} games to Parquet (incremental writing)...")
+    print(f"Writing {len(games):,} games to Parquet (optimized incremental writing)...")
+    print(f"  Batch size: {batch_size:,} games")
 
     # Use ParquetWriter for incremental writing
     writer = None
     total_written = 0
+    rows_in_current_row_group = 0
+
+    # Pre-calculate flattened sequence size for pre-allocation
+    max_seq_len = encoder.max_sequence_length
+    flattened_size = max_seq_len * 13 * 8 * 8  # 200 * 13 * 8 * 8 = 166,400
 
     # Process games in batches
     for i in range(0, len(games), batch_size):
         batch_games = games[i:i + batch_size]
 
-        # Accumulate data for this batch
-        sequences_list = []
+        # Pre-allocate numpy arrays for better performance
+        # We'll filter out invalid sequences, so we can't pre-allocate exact size
+        # But we can use a list of numpy arrays (faster than list of lists)
+        sequences_arrays = []  # List of numpy arrays (no .tolist() conversion!)
         lengths_list = []
         elo_list = []
+        opponent_elo_list = []
+        elo_difference_list = []
+        game_result_list = []
 
         for fen_sequence, white_elo, black_elo, result in batch_games:
             # Encode FEN sequence during preprocessing (faster training)
@@ -105,33 +117,85 @@ def write_games_to_parquet(
                 # This makes it easier to store in Parquet
                 seq_flat = sequence_np.flatten().astype(np.float32)
                 
-                # Select target Elo
-                target_elo = white_elo if use_white_elo else black_elo
+                # Select target Elo and opponent Elo
+                if use_white_elo:
+                    target_elo = white_elo
+                    opponent_elo = black_elo
+                else:
+                    target_elo = black_elo
+                    opponent_elo = white_elo
+                
                 normalized_elo = encoder.normalize_elo(target_elo)
+                normalized_opponent_elo = encoder.normalize_elo(opponent_elo)
+                
+                # Calculate Elo difference (player - opponent), normalized
+                elo_diff = target_elo - opponent_elo
+                # Normalize difference: typical range is -1000 to +1000, normalize to [-1, 1]
+                # Using a reasonable scale (divide by 1000)
+                normalized_elo_diff = np.clip(elo_diff / 1000.0, -1.0, 1.0)
+                
+                # Encode game result from player's perspective
+                # '1-0' = white wins, '0-1' = black wins, '1/2-1/2' = draw
+                if use_white_elo:
+                    # Predicting white's Elo: '1-0' = win, '0-1' = loss, '1/2-1/2' = draw
+                    if result == '1-0':
+                        result_encoded = 1.0
+                    elif result == '0-1':
+                        result_encoded = 0.0
+                    else:  # '1/2-1/2'
+                        result_encoded = 0.5
+                else:
+                    # Predicting black's Elo: '0-1' = win, '1-0' = loss, '1/2-1/2' = draw
+                    if result == '0-1':
+                        result_encoded = 1.0
+                    elif result == '1-0':
+                        result_encoded = 0.0
+                    else:  # '1/2-1/2'
+                        result_encoded = 0.5
                 
                 # Skip sequences with zero or very short length
                 if seq_length < 1:
                     continue
                 
-                sequences_list.append(seq_flat.tolist())  # Convert to list for PyArrow
+                # OPTIMIZATION: Store numpy array directly (no .tolist() conversion!)
+                sequences_arrays.append(seq_flat)
                 lengths_list.append(int(seq_length))
                 elo_list.append(float(normalized_elo))
+                opponent_elo_list.append(float(normalized_opponent_elo))
+                elo_difference_list.append(float(normalized_elo_diff))
+                game_result_list.append(float(result_encoded))
             except Exception as e:
                 # Skip games that fail to encode
                 print(f"Warning: Failed to encode game: {e}")
                 continue
 
         # Skip empty batches
-        if len(sequences_list) == 0:
+        if len(sequences_arrays) == 0:
             continue
+
+        # OPTIMIZATION: Create Arrow arrays directly from numpy arrays
+        # This is much faster than converting to lists first (.tolist() is very slow)
+        # PyArrow can handle list of numpy arrays efficiently - it will convert internally
+        # but this is still much faster than us doing .tolist() first
+        # Ensure arrays are contiguous for better performance
+        sequences_arrays = [np.ascontiguousarray(arr) for arr in sequences_arrays]
+        
+        # Create Arrow arrays - PyArrow will handle numpy arrays efficiently
+        sequences_arrow = pa.array(sequences_arrays, type=pa.list_(pa.float32()))
+        lengths_arrow = pa.array(lengths_list, type=pa.int32())
+        elo_arrow = pa.array(elo_list, type=pa.float32())
+        opponent_elo_arrow = pa.array(opponent_elo_list, type=pa.float32())
+        elo_difference_arrow = pa.array(elo_difference_list, type=pa.float32())
+        game_result_arrow = pa.array(game_result_list, type=pa.float32())
             
         # Create Arrow table for this batch
-        # Store encoded sequences as flattened arrays
-        # We need to store the shape info: (max_seq_len, 13, 8, 8) = (200, 13, 8, 8)
         batch_table = pa.table({
-            'sequence_flat': sequences_list,  # List of flattened encoded sequences
-            'length': pa.array(lengths_list, type=pa.int32()),
-            'elo': pa.array(elo_list, type=pa.float32()),
+            'sequence_flat': sequences_arrow,
+            'length': lengths_arrow,
+            'elo': elo_arrow,
+            'opponent_elo': opponent_elo_arrow,
+            'elo_difference': elo_difference_arrow,
+            'game_result': game_result_arrow,
         })
 
         # Initialize writer on first batch
@@ -139,15 +203,18 @@ def write_games_to_parquet(
             writer = pq.ParquetWriter(
                 output_path,
                 batch_table.schema,
-                compression='snappy',
+                compression='snappy',  # Keep snappy for good balance
             )
 
         # Write batch to Parquet
         writer.write_table(batch_table)
-        total_written += len(batch_games)
+        total_written += len(sequences_arrays)
+        rows_in_current_row_group += len(sequences_arrays)
 
-        # Free the table immediately after writing to reduce memory
+        # Free the table and arrays immediately after writing to reduce memory
         del batch_table
+        del sequences_arrow, lengths_arrow, elo_arrow
+        del sequences_arrays, lengths_list, elo_list
 
         # Progress update
         if (i // batch_size + 1) % 10 == 0 or total_written == len(games):
@@ -164,9 +231,9 @@ def stream_decompress_and_parse(
     input_path: str,
     output_dir: str = "data/processed",
     max_games: int = None,
-    batch_size: int = 1000,
+    batch_size: int = 4000,
     num_workers: int = None,
-    chunk_size: int = 1024 * 1024,  # 1MB chunks
+    chunk_size: int = 2 * 1024 * 1024,  # 2MB chunks
 ) -> list:
     """
     Stream decompress and parse PGN games with parallel processing.
@@ -204,91 +271,123 @@ def stream_decompress_and_parse(
     # Create progress bar
     pbar = tqdm(unit="games", desc="Processing")
 
+    # CRITICAL: Create Pool once and reuse it (much faster than creating for each batch)
+    # Creating/destroying pools has significant overhead
+    pool = Pool(num_workers) if num_workers > 1 else None
+    
     def process_game_batch(games_text_batch):
         """Process a batch of games in parallel."""
-        with Pool(num_workers) as pool:
-            # Split games into chunks for each worker
-            chunk_size = max(1, len(games_text_batch) // num_workers)
-            chunks = [
-                games_text_batch[i:i + chunk_size]
-                for i in range(0, len(games_text_batch), chunk_size)
-            ]
-            results = pool.map(parse_game_batch, chunks)
-            # Flatten results
-            return [game for chunk_results in results for game in chunk_results]
+        if pool is None:
+            # Single-threaded fallback
+            return parse_game_batch(games_text_batch)
+        
+        # Split games into chunks for each worker
+        chunk_size_worker = max(1, len(games_text_batch) // num_workers)
+        chunks = [
+            games_text_batch[i:i + chunk_size_worker]
+            for i in range(0, len(games_text_batch), chunk_size_worker)
+        ]
+        results = pool.map(parse_game_batch, chunks)
+        # Flatten results
+        return [game for chunk_results in results for game in chunk_results]
 
-    with open(input_path, 'rb') as f_in:
-        with dctx.stream_reader(f_in) as reader:
-            # Read and decompress in chunks for better memory efficiency
-            text_buffer = ""
+    try:
+        with open(input_path, 'rb') as f_in:
+            with dctx.stream_reader(f_in) as reader:
+                # Read and decompress in chunks for better memory efficiency
+                text_buffer = ""
+                max_buffer_size = 10 * 1024 * 1024  # Limit buffer to 10MB to prevent unbounded growth
+                should_stop = False  # Flag to stop processing when max_games is reached
 
-            while True:
-                chunk = reader.read(chunk_size)
-                if not chunk:
-                    break
+                while True:
+                    if should_stop:
+                        break
+                    
+                    chunk = reader.read(chunk_size)
+                    if not chunk:
+                        break
 
-                # Decode chunk and add to buffer
-                try:
-                    text_buffer += chunk.decode('utf-8', errors='ignore')
-                except:
-                    continue
+                    # Decode chunk and add to buffer
+                    try:
+                        text_buffer += chunk.decode('utf-8', errors='ignore')
+                        # Prevent unbounded buffer growth (safety check)
+                        if len(text_buffer) > max_buffer_size:
+                            # Keep only the last part if buffer gets too large
+                            # This handles edge cases with very long lines
+                            last_newline = text_buffer.rfind('\n', 0, max_buffer_size // 2)
+                            if last_newline > 0:
+                                text_buffer = text_buffer[last_newline + 1:]
+                    except:
+                        continue
 
-                # Process complete lines from buffer
-                while '\n' in text_buffer:
-                    line, text_buffer = text_buffer.split('\n', 1)
+                    # Process complete lines from buffer
+                    while '\n' in text_buffer:
+                        line, text_buffer = text_buffer.split('\n', 1)
 
-                    current_game.append(line)
+                        current_game.append(line)
 
-                    # Check for game boundary (blank line after moves)
-                    if line.strip() == "" and current_game:
-                        # Check if this looks like a complete game
-                        has_moves = any(
-                            l.strip().startswith("1. ") or " 1. " in l
-                            for l in current_game
-                        )
+                        # Check for game boundary (blank line after moves)
+                        if line.strip() == "" and current_game:
+                            # Check if this looks like a complete game
+                            has_moves = any(
+                                l.strip().startswith("1. ") or " 1. " in l
+                                for l in current_game
+                            )
 
-                        if has_moves:
-                            game_text = "\n".join(current_game)
-                            game_buffer.append(game_text)
+                            if has_moves:
+                                game_text = "\n".join(current_game)
+                                game_buffer.append(game_text)
 
-                            # Process batch when we have enough games
-                            if len(game_buffer) >= batch_size:
-                                parsed_batch = process_game_batch(game_buffer)
-                                all_games.extend(parsed_batch)
-                                game_count += len(parsed_batch)
-                                batch_count += 1
+                                # Process batch when we have enough games
+                                if len(game_buffer) >= batch_size:
+                                    parsed_batch = process_game_batch(game_buffer)
+                                    all_games.extend(parsed_batch)
+                                    game_count += len(parsed_batch)
+                                    batch_count += 1
 
-                                # Update progress
-                                elapsed = time.time() - start_time
-                                games_per_sec = game_count / elapsed if elapsed > 0 else 0
-                                pbar.update(len(parsed_batch))
-                                pbar.set_description(
-                                    f"Processing | {game_count:,} games | {games_per_sec:.0f} games/sec"
-                                )
+                                    # Update progress
+                                    elapsed = time.time() - start_time
+                                    games_per_sec = game_count / elapsed if elapsed > 0 else 0
+                                    pbar.update(len(parsed_batch))
+                                    pbar.set_description(
+                                        f"Processing | {game_count:,} games | {games_per_sec:.0f} games/sec"
+                                    )
 
-                                # Optional: Save checkpoint periodically (can be disabled for Parquet-only)
-                                # if batch_count % 50 == 0:
-                                #     checkpoint_path = os.path.join(
-                                #         output_dir, f"games_batch_{batch_count}.pkl"
-                                #     )
-                                #     with open(checkpoint_path, 'wb') as f:
-                                #         pickle.dump(all_games, f)
-                                #     pbar.write(f"Checkpoint: Saved {game_count:,} games")
+                                    # Optional: Save checkpoint periodically (can be disabled for Parquet-only)
+                                    # if batch_count % 50 == 0:
+                                    #     checkpoint_path = os.path.join(
+                                    #         output_dir, f"games_batch_{batch_count}.pkl"
+                                    #     )
+                                    #     with open(checkpoint_path, 'wb') as f:
+                                    #         pickle.dump(all_games, f)
+                                    #     pbar.write(f"Checkpoint: Saved {game_count:,} games")
 
-                                game_buffer = []
+                                    game_buffer = []
+                                    
+                                    # Periodic garbage collection hint (every 10 batches)
+                                    if batch_count % 10 == 0:
+                                        import gc
+                                        gc.collect()
 
-                                if max_games and game_count >= max_games:
-                                    break
+                                    if max_games and game_count >= max_games:
+                                        should_stop = True
+                                        break
 
-                            current_game = []
+                                current_game = []
 
-            # Process remaining games in buffer
-            if game_buffer:
-                parsed_batch = process_game_batch(game_buffer)
-                all_games.extend(parsed_batch)
-                game_count += len(parsed_batch)
-                pbar.update(len(parsed_batch))
-
+                # Process remaining games in buffer
+                if game_buffer:
+                    parsed_batch = process_game_batch(game_buffer)
+                    all_games.extend(parsed_batch)
+                    game_count += len(parsed_batch)
+                    pbar.update(len(parsed_batch))
+    
+    finally:
+        # Clean up pool
+        if pool is not None:
+            pool.close()
+            pool.join()
+    
     pbar.close()
 
     elapsed = time.time() - start_time
@@ -318,6 +417,7 @@ def create_datasets(
     use_white_elo: bool = True,
     max_sequence_length: int = 200,
     save_pickle: bool = False,
+    parquet_batch_size: int = 2000,
 ) -> tuple:
     """
     Split games into train/val/test sets and save to Parquet.
@@ -359,6 +459,7 @@ def create_datasets(
         parquet_path / "train_games.parquet",
         encoder,
         use_white_elo=use_white_elo,
+        batch_size=parquet_batch_size,
     )
 
     print("\nWriting validation split to Parquet...")
@@ -367,6 +468,7 @@ def create_datasets(
         parquet_path / "val_games.parquet",
         encoder,
         use_white_elo=use_white_elo,
+        batch_size=parquet_batch_size,
     )
 
     print("\nWriting test split to Parquet...")
@@ -375,6 +477,7 @@ def create_datasets(
         parquet_path / "test_games.parquet",
         encoder,
         use_white_elo=use_white_elo,
+        batch_size=parquet_batch_size,
     )
     print()
 
@@ -422,7 +525,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2000,  # Larger batch for better parallelization
+        default=4000,  # Moderately large batch for better parallelization
         help="Batch size for parallel processing",
     )
     parser.add_argument(
@@ -434,7 +537,7 @@ def main():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=1024 * 1024,  # 1MB
+        default=2 * 1024 * 1024,  # 2MB
         help="Chunk size for streaming decompression",
     )
     parser.add_argument(

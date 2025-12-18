@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import numpy as np
 from pathlib import Path
 import tensorflow as tf
+from tensorflow import keras
 import os
 import sys
 import argparse
@@ -30,17 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # IMMEDIATE GPU CHECK - right after TensorFlow import, before any other imports
 # This helps diagnose if later imports are interfering with GPU detection
+# Skip if --skip-gpu-init or --num-gpus is in command line args (notebook use case)
+_skip_gpu_check = '--skip-gpu-init' in sys.argv or '--num-gpus' in sys.argv
 _gpus_immediate = tf.config.list_physical_devices('GPU')
-if len(_gpus_immediate) == 0:
-    print("WARNING: No GPUs detected immediately after TensorFlow import!")
-    print(f"  LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
-    print(
-        f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-else:
-    print(
-        f"✓ Detected {len(_gpus_immediate)} GPU(s) immediately after TensorFlow import")
-
-
 # Check for TensorRT availability (optional, for inference optimization)
 TENSORRT_AVAILABLE = False
 try:
@@ -50,61 +43,320 @@ try:
 except (ImportError, ModuleNotFoundError):
     # TensorRT not installed - that's okay, it's optional
     pass
-
+if not _skip_gpu_check:
+    if len(_gpus_immediate) == 0:
+        print("WARNING: No GPUs detected immediately after TensorFlow import!")
+        print(f"  LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
+        print(
+            f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+    else:
+        print(
+            f"✓ Detected {len(_gpus_immediate)} GPU(s) immediately after TensorFlow import")
 # Import src modules AFTER TensorFlow and sys.path setup
-from src.models.transformer_tf import build_transformer_model
+from src.models.transformer_tf import build_transformer_model, TransformerEncoder
+from src.models.lstm_tf import build_lstm_model, LSTMEloPredictor
 from src.data.data_utils_tf import (
     load_pickle_dataset,
     convert_games_to_parquet,
     create_streaming_dataset,
     create_dataset_from_pickle,
+    preload_parquet_to_memory,
+    create_preloaded_dataset,
 )
 from src.data.encoder import FENEncoder
 
-def find_latest_checkpoint(checkpoint_dir: Path, prefix: str):
+
+@tf.keras.utils.register_keras_serializable(package="elo")
+def safe_mse_loss(y_true, y_pred):
+    """MSE loss with NaN protection."""
+    # Clip predictions to [0, 1] range
+    y_pred = tf.clip_by_value(y_pred, 0.0, 1.0)
+    # Replace any NaN in predictions with 0.5 (middle of range)
+    y_pred = tf.where(tf.math.is_nan(y_pred),
+                      0.5 * tf.ones_like(y_pred), y_pred)
+    # Compute MSE manually: mean squared difference
+    squared_diff = tf.square(y_true - y_pred)
+    loss = tf.reduce_mean(squared_diff)
+    # Replace any NaN in loss with a large value (will trigger gradient clipping)
+    loss = tf.where(tf.math.is_nan(loss), 1e6 * tf.ones_like(loss), loss)
+    return loss
+
+
+@tf.keras.utils.register_keras_serializable(package="elo")
+def safe_mae_metric(y_true, y_pred):
+    """MAE metric with NaN protection."""
+    y_pred = tf.clip_by_value(y_pred, 0.0, 1.0)
+    y_pred = tf.where(tf.math.is_nan(y_pred),
+                      0.5 * tf.ones_like(y_pred), y_pred)
+    # Compute MAE manually: mean absolute difference
+    mae = tf.reduce_mean(tf.abs(y_true - y_pred))
+    mae = tf.where(tf.math.is_nan(mae), tf.zeros_like(mae), mae)
+    return mae
+
+
+class ComprehensiveMetricsCallback(tf.keras.callbacks.Callback):
     """
-    Find the latest checkpoint file in the checkpoint directory.
-
-    Args:
-        checkpoint_dir: Directory containing checkpoints
-        prefix: Prefix for checkpoint filenames (e.g., "transformer_elo")
-
-    Returns:
-        Path to latest checkpoint or None if not found
+    Comprehensive metrics tracking for rich visualizations.
+    
+    Tracks per-epoch and per-batch statistics including:
+    - Loss and MAE in both normalized and Elo scale
+    - Learning rate schedule
+    - Per-batch loss statistics (min, max, std)
+    - Training time per epoch
+    - Best metrics and when they occurred
     """
-    if not checkpoint_dir.exists():
-        return None
-
-    # Look for checkpoint files matching pattern: {prefix}_checkpoint_epoch-{epoch}.keras
-    pattern = f"{prefix}_checkpoint_epoch-*.keras"
-    checkpoints = sorted(checkpoint_dir.glob(pattern))
-
-    if not checkpoints:
-        return None
-
-    # Return the latest (highest epoch number)
-    return checkpoints[-1]
-
-
-def get_epoch_from_checkpoint(checkpoint_path: Path) -> int:
-    """
-    Extract epoch number from checkpoint filename.
-
-    Args:
-        checkpoint_path: Path to checkpoint file
-
-    Returns:
-        Epoch number (0-indexed)
-    """
-    # Expected format: {prefix}_checkpoint_epoch-{epoch}.keras
-    filename = checkpoint_path.stem  # Get name without extension
-    parts = filename.split("_epoch-")
-    if len(parts) == 2:
+    
+    ELO_RANGE = 2000  # 2800 - 800 = 2000 Elo range for denormalization
+    
+    def __init__(self, log_dir, log_file=None):
+        super().__init__()
+        self.log_dir = Path(log_dir)
+        self.log_file = log_file
+        
+        # Per-epoch metrics
+        self.history = {
+            'epoch': [],
+            'lr': [],
+            'time_seconds': [],
+            # Training metrics (normalized)
+            'train_loss': [],
+            'train_mae': [],
+            # Training metrics (Elo scale)
+            'train_rmse_elo': [],
+            'train_mae_elo': [],
+            # Validation metrics (normalized)
+            'val_loss': [],
+            'val_mae': [],
+            # Validation metrics (Elo scale)
+            'val_rmse_elo': [],
+            'val_mae_elo': [],
+            # Per-batch statistics for training loss
+            'batch_loss_min': [],
+            'batch_loss_max': [],
+            'batch_loss_std': [],
+            'batch_count': [],
+        }
+        
+        # Best metrics tracking
+        self.best_metrics = {
+            'best_val_loss': float('inf'),
+            'best_val_loss_epoch': 0,
+            'best_val_mae_elo': float('inf'),
+            'best_val_mae_elo_epoch': 0,
+        }
+        
+        # Per-batch tracking (reset each epoch)
+        self._batch_losses = []
+        self._epoch_start_time = None
+    
+    def on_epoch_begin(self, epoch, logs=None):
+        self._batch_losses = []
+        self._epoch_start_time = time.perf_counter()
+    
+    def on_train_batch_end(self, batch, logs=None):
+        if logs and 'loss' in logs:
+            self._batch_losses.append(logs['loss'])
+    
+    def on_epoch_end(self, epoch, logs=None):
+        if logs is None:
+            logs = {}
+        
+        epoch_time = time.perf_counter() - self._epoch_start_time
+        
+        # Get current learning rate
         try:
-            return int(parts[1])
-        except ValueError:
-            return 0
-    return 0
+            lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+        except:
+            lr = 0.0
+        
+        # Extract metrics
+        train_loss = logs.get('loss', 0)
+        train_mae = logs.get('safe_mae_metric', logs.get('mae', 0))
+        val_loss = logs.get('val_loss', 0)
+        val_mae = logs.get('val_safe_mae_metric', logs.get('val_mae', 0))
+        
+        # Convert to Elo scale
+        train_rmse_elo = np.sqrt(train_loss) * self.ELO_RANGE if train_loss else 0
+        train_mae_elo = train_mae * self.ELO_RANGE if train_mae else 0
+        val_rmse_elo = np.sqrt(val_loss) * self.ELO_RANGE if val_loss else 0
+        val_mae_elo = val_mae * self.ELO_RANGE if val_mae else 0
+        
+        # Batch statistics
+        batch_losses = np.array(self._batch_losses) if self._batch_losses else np.array([0])
+        
+        # Store metrics
+        self.history['epoch'].append(epoch + 1)
+        self.history['lr'].append(lr)
+        self.history['time_seconds'].append(epoch_time)
+        
+        self.history['train_loss'].append(float(train_loss))
+        self.history['train_mae'].append(float(train_mae))
+        self.history['train_rmse_elo'].append(float(train_rmse_elo))
+        self.history['train_mae_elo'].append(float(train_mae_elo))
+        
+        self.history['val_loss'].append(float(val_loss))
+        self.history['val_mae'].append(float(val_mae))
+        self.history['val_rmse_elo'].append(float(val_rmse_elo))
+        self.history['val_mae_elo'].append(float(val_mae_elo))
+        
+        self.history['batch_loss_min'].append(float(batch_losses.min()))
+        self.history['batch_loss_max'].append(float(batch_losses.max()))
+        self.history['batch_loss_std'].append(float(batch_losses.std()))
+        self.history['batch_count'].append(len(self._batch_losses))
+        
+        # Update best metrics
+        if val_loss < self.best_metrics['best_val_loss']:
+            self.best_metrics['best_val_loss'] = float(val_loss)
+            self.best_metrics['best_val_loss_epoch'] = epoch + 1
+        
+        if val_mae_elo < self.best_metrics['best_val_mae_elo']:
+            self.best_metrics['best_val_mae_elo'] = float(val_mae_elo)
+            self.best_metrics['best_val_mae_elo_epoch'] = epoch + 1
+    
+    def on_train_end(self, logs=None):
+        """Save comprehensive metrics to JSON file."""
+        import json
+        
+        # Compute summary statistics
+        summary = {
+            'total_epochs': len(self.history['epoch']),
+            'total_training_time_seconds': sum(self.history['time_seconds']),
+            'total_training_time_minutes': sum(self.history['time_seconds']) / 60,
+            'avg_epoch_time_seconds': np.mean(self.history['time_seconds']) if self.history['time_seconds'] else 0,
+            'final_train_loss': self.history['train_loss'][-1] if self.history['train_loss'] else None,
+            'final_val_loss': self.history['val_loss'][-1] if self.history['val_loss'] else None,
+            'final_val_rmse_elo': self.history['val_rmse_elo'][-1] if self.history['val_rmse_elo'] else None,
+            'final_val_mae_elo': self.history['val_mae_elo'][-1] if self.history['val_mae_elo'] else None,
+            **self.best_metrics,
+        }
+        
+        output = {
+            'history': self.history,
+            'summary': summary,
+            'best_metrics': self.best_metrics,
+        }
+        
+        # Save to JSON
+        json_path = self.log_dir / 'training_history.json'
+        with open(json_path, 'w') as f:
+            json.dump(output, f, indent=2)
+        
+        print(f"\n✓ Comprehensive metrics saved to {json_path}")
+        
+        # Also save as CSV for easy loading in pandas
+        import pandas as pd
+        df = pd.DataFrame(self.history)
+        csv_path = self.log_dir / 'detailed_metrics.csv'
+        df.to_csv(csv_path, index=False)
+        print(f"✓ Detailed CSV metrics saved to {csv_path}")
+    
+    def get_history(self):
+        """Return the history dict for programmatic access."""
+        return {
+            'history': self.history.copy(),
+            'summary': {
+                'total_epochs': len(self.history['epoch']),
+                'total_training_time_seconds': sum(self.history['time_seconds']),
+                **self.best_metrics,
+            },
+            'best_metrics': self.best_metrics.copy(),
+        }
+
+
+# Ensure custom classes and functions are registered in TensorFlow Keras global registry
+# This is critical for TensorFlow Keras to find them during model loading
+# The decorators above register them, but we also explicitly add them to the registry
+# to ensure they're available when loading checkpoints
+try:
+    # Register with package prefix (format: "package>ClassName")
+    custom_objects_registry = tf.keras.utils.get_custom_objects()
+    custom_objects_registry['elo>TransformerEncoder'] = TransformerEncoder
+    custom_objects_registry['elo>LSTMEloPredictor'] = LSTMEloPredictor
+    custom_objects_registry['elo>safe_mse_loss'] = safe_mse_loss
+    custom_objects_registry['elo>safe_mae_metric'] = safe_mae_metric
+except (AttributeError, KeyError):
+    pass  # Will rely on custom_objects parameter instead
+
+def extract_hyperparameters_from_checkpoint(checkpoint_path: Path):
+    """
+    Extract hyperparameters from a checkpoint file by reading its config.
+    Returns a dict with hyperparameters or None if extraction fails.
+    """
+    try:
+        import zipfile
+        import json
+        
+        # .keras files are zip archives
+        with zipfile.ZipFile(checkpoint_path, 'r') as z:
+            # Read the config.json file
+            config_data = z.read('config.json')
+            config = json.loads(config_data)
+            
+            hyperparams = {}
+            
+            # Check if this is a TransformerEncoder at the top level
+            # Config structure: {'module': ..., 'class_name': 'TransformerEncoder', 'config': {...}, ...}
+            class_name = config.get('class_name', '')
+            registered_name = config.get('registered_name', '')
+            
+            if 'TransformerEncoder' in class_name or 'TransformerEncoder' in registered_name:
+                # Found it at top level! Extract hyperparameters from 'config' key
+                if 'config' in config:
+                    cfg = config['config']
+                    print(f"Debug: Found TransformerEncoder config keys: {list(cfg.keys())}")
+                    
+                    # Extract all hyperparameters we care about
+                    if 'embedding_dim' in cfg:
+                        hyperparams['embedding_dim'] = cfg['embedding_dim']
+                    if 'num_layers' in cfg:
+                        hyperparams['num_layers'] = cfg['num_layers']
+                    if 'num_heads' in cfg:
+                        hyperparams['num_heads'] = cfg['num_heads']
+                    if 'feedforward_dim' in cfg:
+                        hyperparams['feedforward_dim'] = cfg['feedforward_dim']
+                    if 'dropout' in cfg:
+                        hyperparams['dropout'] = cfg['dropout']
+                    if 'max_sequence_length' in cfg:
+                        hyperparams['max_sequence_length'] = cfg['max_sequence_length']
+            
+            # Also check for LSTMEloPredictor
+            elif 'LSTMEloPredictor' in class_name or 'LSTMEloPredictor' in registered_name:
+                if 'config' in config:
+                    cfg = config['config']
+                    print(f"Debug: Found LSTMEloPredictor config keys: {list(cfg.keys())}")
+                    
+                    if 'embedding_dim' in cfg:
+                        hyperparams['embedding_dim'] = cfg['embedding_dim']
+                    if 'num_lstm_layers' in cfg:
+                        hyperparams['num_layers'] = cfg['num_lstm_layers']
+                    if 'lstm_hidden_dim' in cfg:
+                        hyperparams['lstm_hidden_dim'] = cfg['lstm_hidden_dim']
+                    if 'bidirectional' in cfg:
+                        hyperparams['bidirectional'] = cfg['bidirectional']
+                    if 'feedforward_dim' in cfg:
+                        hyperparams['feedforward_dim'] = cfg['feedforward_dim']
+                    if 'dropout' in cfg:
+                        hyperparams['dropout'] = cfg['dropout']
+                    if 'max_sequence_length' in cfg:
+                        hyperparams['max_sequence_length'] = cfg['max_sequence_length']
+            else:
+                # Debug: print config structure if extraction failed
+                print(f"Debug: class_name='{class_name}', registered_name='{registered_name}'")
+                print(f"Debug: Top-level keys: {list(config.keys())}")
+                if 'config' in config:
+                    print(f"Debug: config keys: {list(config['config'].keys())}")
+            
+            if hyperparams:
+                return hyperparams
+                
+    except Exception as e:
+        print(f"Could not extract hyperparameters from checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return None
+
+
 
 
 def create_epoch_logger(log_every: int = 1, log_file=None):
@@ -150,8 +402,11 @@ def main(args=None):
     # ============================================================================
     # Parse command-line arguments if provided
     parser = argparse.ArgumentParser(
-        description="Train optimized Transformer model for Elo prediction"
+        description="Train optimized Transformer or LSTM model for Elo prediction"
     )
+    parser.add_argument("--model-type", type=str, default="transformer",
+                        choices=["transformer", "lstm"],
+                        help="Model architecture: 'transformer' or 'lstm' (default: transformer)")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size per GPU (default: 32)")
     parser.add_argument("--epochs", type=int, default=50,
@@ -163,9 +418,15 @@ def main(args=None):
     parser.add_argument("--embedding-dim", type=int, default=256,
                         help="Embedding dimension (default: 256, increased from 128)")
     parser.add_argument("--num-layers", type=int, default=6,
-                        help="Number of transformer layers (default: 6, increased from 4)")
+                        help="Number of transformer layers or LSTM layers (default: 6)")
     parser.add_argument("--num-heads", type=int, default=8,
-                        help="Number of attention heads (default: 8)")
+                        help="Number of attention heads (transformer only, default: 8)")
+    parser.add_argument("--lstm-hidden-dim", type=int, default=256,
+                        help="LSTM hidden dimension (LSTM only, default: 256)")
+    parser.add_argument("--no-bidirectional", action="store_false", dest="bidirectional",
+                        help="Disable bidirectional LSTM (LSTM only, default: True)")
+    # Set default for bidirectional (True by default)
+    parser.set_defaults(bidirectional=True)
     parser.add_argument("--feedforward-dim", type=int, default=1024,
                         help="Feedforward network dimension (default: 1024, increased from 512)")
     parser.add_argument("--dropout", type=float, default=0.2,
@@ -178,22 +439,34 @@ def main(args=None):
                         help="Use cosine annealing schedule instead of ReduceLROnPlateau")
     parser.add_argument("--max-seq-len", type=int, default=200,
                         help="Maximum sequence length (default: 200)")
-    parser.add_argument("--shuffle-buffer", type=int, default=10000,
-                        help="Shuffle buffer size (default: 10000)")
-    parser.add_argument("--model-prefix", type=str, default="transformer_elo_optimized",
-                        help="Model prefix for checkpoints (default: transformer_elo_optimized)")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
-                        help="Checkpoint directory (default: checkpoints)")
+    parser.add_argument("--shuffle-buffer", type=int, default=50000,
+                        help="Shuffle buffer size (default: 50000, larger = better randomness)")
+    parser.add_argument("--preload", action="store_true", default=False,
+                        help="Pre-load data into RAM (use only with small datasets)")
+    parser.add_argument("--no-preload", dest="preload", action="store_false",
+                        help="Use streaming mode (default, memory-safe)")
+    parser.add_argument("--max-samples", type=int, default=250000,
+                        help="Max samples to preload if --preload is used (default: 250K)")
+    parser.add_argument("--model-prefix", type=str, default=None,
+                        help="Model prefix for saved models (default: {model_type}_elo_optimized)")
     parser.add_argument("--data-dir", type=str, default="data/processed",
                         help="Data directory (default: data/processed)")
     parser.add_argument("--parquet-dir", type=str, default="data/parquet",
                         help="Parquet data directory (default: data/parquet)")
-    parser.add_argument("--no-mixed-precision", action="store_true",
-                        help="Disable mixed precision training")
+    parser.add_argument("--max-train-samples", type=int, default=None,
+                        help="Maximum training samples per epoch (for quick testing with large datasets)")
+    parser.add_argument("--max-val-samples", type=int, default=None,
+                        help="Maximum validation samples per epoch (for quick testing with large datasets)")
+    parser.add_argument("--use-mixed-precision", action="store_true",
+                        help="Enable mixed precision training (FP16) for ~2x speedup. Default: disabled for stability.")
     parser.add_argument("--no-parquet", action="store_true",
                         help="Force use of pickle files instead of Parquet")
     parser.add_argument("--use-black-elo", action="store_true",
                         help="Use black player's Elo instead of white's")
+    parser.add_argument("--num-gpus", type=int, default=None,
+                        help="Override GPU count (use when GPUs already detected, e.g., in notebooks)")
+    parser.add_argument("--skip-gpu-init", action="store_true",
+                        help="Skip GPU initialization (use when TensorFlow already configured)")
 
     if args is None:
         args = parser.parse_args()
@@ -207,6 +480,9 @@ def main(args=None):
     # With 4 GPUs, effective batch size = BATCH_SIZE * 4
     BATCH_SIZE = args.batch_size
 
+    # Model type - define early so it can be used for MODEL_PREFIX
+    MODEL_TYPE = args.model_type.lower()
+    
     EPOCHS = args.epochs
     EARLY_STOPPING_PATIENCE = args.early_stopping_patience
     WARMUP_EPOCHS = args.warmup_epochs
@@ -214,14 +490,19 @@ def main(args=None):
     WEIGHT_DECAY = args.weight_decay
     VAL_SPLIT = 0.1
     TEST_SPLIT = 0.1
-    MODEL_PREFIX = args.model_prefix
-    CHECKPOINT_DIR = Path(args.checkpoint_dir)
+    # Set default model prefix based on model type if not provided
+    if args.model_prefix is None:
+        MODEL_PREFIX = f"{MODEL_TYPE}_elo_optimized"
+    else:
+        MODEL_PREFIX = args.model_prefix
 
     # Optimized shuffle buffer
     SHUFFLE_BUFFER = args.shuffle_buffer
 
-    # Enable mixed precision for ~2x speedup on modern GPUs
-    USE_MIXED_PRECISION = not args.no_mixed_precision
+    # Mixed precision (FP16) - disabled by default for stability
+    # Can cause numerical instability and overflow warnings
+    # Enable with --use-mixed-precision for ~2x speedup on modern GPUs
+    USE_MIXED_PRECISION = args.use_mixed_precision
 
     # Learning rate - may need adjustment with larger batch size
     BASE_LR = args.lr
@@ -235,6 +516,8 @@ def main(args=None):
     EMBEDDING_DIM = args.embedding_dim
     NUM_LAYERS = args.num_layers
     NUM_HEADS = args.num_heads
+    LSTM_HIDDEN_DIM = args.lstm_hidden_dim
+    BIDIRECTIONAL = args.bidirectional
     FEEDFORWARD_DIM = args.feedforward_dim
     DROPOUT = args.dropout
     MAX_SEQUENCE_LENGTH = args.max_seq_len
@@ -243,16 +526,25 @@ def main(args=None):
     USE_PARQUET = not args.no_parquet
     USE_WHITE_ELO = not args.use_black_elo
 
-    # Check GPU detection immediately after TensorFlow import
-    gpus = tf.config.list_physical_devices('GPU')
+    # GPU detection - use override if provided (e.g., from notebook)
+    if args.num_gpus is not None:
+        # Use the provided GPU count (already detected in notebook)
+        num_gpus = args.num_gpus
+        gpus = tf.config.list_physical_devices('GPU')  # Still get list for display
+        print(f"Using {num_gpus} GPU(s) (from --num-gpus override)")
+    else:
+        # Detect GPUs
+        gpus = tf.config.list_physical_devices('GPU')
+        num_gpus = len(gpus)
 
     print("=" * 60)
     print("OPTIMIZED TRAINING CONFIGURATION")
     print("=" * 60)
+    print(f"Model type: {MODEL_TYPE.upper()}")
     print(f"Batch size per GPU: {BATCH_SIZE}")
-    print(f"Number of GPUs: {len(gpus)}")
-    if len(gpus) > 0:
-        print(f"Effective batch size: {BATCH_SIZE * len(gpus)}")
+    print(f"Number of GPUs: {num_gpus}")
+    if num_gpus > 0:
+        print(f"Effective batch size: {BATCH_SIZE * num_gpus}")
         for i, gpu in enumerate(gpus):
             print(f"  GPU {i}: {gpu.name}")
     else:
@@ -272,8 +564,12 @@ def main(args=None):
             f"LR schedule: Cosine annealing with {WARMUP_EPOCHS} epoch warmup")
     else:
         print(f"LR schedule: ReduceLROnPlateau")
-    print(
-        f"Model: Transformer (embed_dim={EMBEDDING_DIM}, layers={NUM_LAYERS})")
+    if MODEL_TYPE == "transformer":
+        print(
+            f"Model: Transformer (embed_dim={EMBEDDING_DIM}, layers={NUM_LAYERS}, heads={NUM_HEADS})")
+    else:
+        print(
+            f"Model: LSTM (embed_dim={EMBEDDING_DIM}, layers={NUM_LAYERS}, hidden_dim={LSTM_HIDDEN_DIM}, bidirectional={BIDIRECTIONAL})")
     if TENSORRT_AVAILABLE:
         print(f"TensorRT: Available (will optimize inference)")
     else:
@@ -282,11 +578,22 @@ def main(args=None):
     print()
 
     # Enable mixed precision if requested
+    # WARNING: Mixed precision can cause:
+    #   - Numerical instability (NaN/Inf)
+    #   - Overflow warnings during casting
+    #   - Slightly different results vs FP32
+    # Benefits: ~2x faster training, ~50% less memory
+    # Default: disabled for stability. Enable with --use-mixed-precision
     if USE_MIXED_PRECISION:
         policy = tf.keras.mixed_precision.Policy('mixed_float16')
         tf.keras.mixed_precision.set_global_policy(policy)
         print("✓ Mixed precision (FP16) enabled")
         print("  Note: Output layer will use float32 for numerical stability")
+        print("  Warning: May cause overflow warnings - these are usually harmless")
+        print()
+    else:
+        print("✓ Mixed precision disabled (using FP32)")
+        print("  This is more stable but slower and uses more memory")
         print()
 
     # Load or convert data
@@ -320,35 +627,79 @@ def main(args=None):
             f"Train: {num_train_groups} row groups, ~{total_train_rows:,} games")
         print(f"Val: {num_val_groups} row groups, ~{total_val_rows:,} games")
 
-        # Create streaming datasets
+        # Get row group indices
         train_row_groups = list(range(num_train_groups))
         val_row_groups = list(range(num_val_groups))
 
-        print("Creating optimized datasets...")
-        train_dataset = create_streaming_dataset(
-            train_parquet,
-            train_row_groups,
-            BATCH_SIZE,
-            shuffle_buffer=SHUFFLE_BUFFER,
-            num_parallel_calls=NUM_PARALLEL_CALLS,
-            max_sequence_length=MAX_SEQUENCE_LENGTH,
-        )
-        val_dataset = create_streaming_dataset(
-            val_parquet,
-            val_row_groups,
-            BATCH_SIZE,
-            shuffle_buffer=None,  # No shuffle for validation
-            num_parallel_calls=NUM_PARALLEL_CALLS,
-            max_sequence_length=MAX_SEQUENCE_LENGTH,
-        )
-        print("✓ Datasets created")
-        print()
+        # Choose between preloading (faster) and streaming (lower memory)
+        PRELOAD_DATA = args.preload
+        
+        if PRELOAD_DATA:
+            MAX_SAMPLES = args.max_samples
+            if MAX_SAMPLES > 0:
+                est_gb = MAX_SAMPLES * 0.00063  # ~0.63 MB per sample
+                print(f"Pre-loading up to {MAX_SAMPLES:,} samples (~{est_gb:.0f} GB)...")
+            else:
+                print("Pre-loading ALL data into RAM...")
+            
+            # Pre-load training data
+            print("  Train: ", end="", flush=True)
+            train_sequences, train_lengths, train_targets, train_opp_features = \
+                preload_parquet_to_memory(train_parquet, train_row_groups, encoder, max_samples=MAX_SAMPLES)
+            
+            # Pre-load validation data (use proportional limit: ~12.5% of train)
+            val_max = MAX_SAMPLES // 8 if MAX_SAMPLES > 0 else 0
+            print("  Val:   ", end="", flush=True)
+            val_sequences, val_lengths, val_targets, val_opp_features = \
+                preload_parquet_to_memory(val_parquet, val_row_groups, encoder, max_samples=val_max)
+            
+            train_dataset = create_preloaded_dataset(
+                train_sequences, train_lengths, train_targets, train_opp_features,
+                batch_size=BATCH_SIZE,
+                shuffle=True,
+                drop_remainder=True,
+            )
+            val_dataset = create_preloaded_dataset(
+                val_sequences, val_lengths, val_targets, val_opp_features,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                drop_remainder=True,
+            )
+            
+            # Update row counts for steps calculation
+            total_train_rows = len(train_sequences)
+            total_val_rows = len(val_sequences)
+            print()
+        else:
+            # Streaming mode (original approach)
+            print("Creating streaming datasets...")
+            train_dataset = create_streaming_dataset(
+                train_parquet,
+                train_row_groups,
+                BATCH_SIZE,
+                shuffle_buffer=SHUFFLE_BUFFER,
+                num_parallel_calls=NUM_PARALLEL_CALLS,
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+            )
+            val_dataset = create_streaming_dataset(
+                val_parquet,
+                val_row_groups,
+                BATCH_SIZE,
+                shuffle_buffer=None,  # No shuffle for validation
+                num_parallel_calls=NUM_PARALLEL_CALLS,
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+            )
+            print("✓ Streaming datasets created")
+            print()
 
     else:
         # Fall back to pickle files
         print("Parquet files not found, using pickle files...")
         print("(Consider converting to Parquet for better performance)")
         print()
+        
+        # Preloading not supported for pickle (already in-memory)
+        PRELOAD_DATA = False
 
         # Load pickle data
         train_games, val_games, test_games = load_pickle_dataset(str(DATA_DIR))
@@ -379,9 +730,6 @@ def main(args=None):
         print("✓ Datasets created")
         print()
 
-    # Check for existing checkpoint
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-
     # Create logs directory for TensorBoard, CSV, and text logs
     LOGS_DIR = Path("logs")
     LOGS_DIR.mkdir(exist_ok=True)
@@ -410,23 +758,12 @@ def main(args=None):
     log_print(f"Log directory: {RUN_DIR}")
     log_print(f"Model prefix: {MODEL_PREFIX}")
     log_print("=" * 60)
-
-    latest_checkpoint = find_latest_checkpoint(CHECKPOINT_DIR, MODEL_PREFIX)
-    initial_epoch = 0
-
-    if latest_checkpoint is not None:
-        epoch_num = get_epoch_from_checkpoint(latest_checkpoint)
-        print(f"Found checkpoint: {latest_checkpoint}")
-        print(f"Resuming from epoch {epoch_num + 1}")
-        initial_epoch = epoch_num + 1
-    else:
-        print("No checkpoint found, starting from scratch")
     print()
 
     # Setup multi-GPU strategy (exactly like run_full_train_optimized.py)
-    gpus = tf.config.list_physical_devices('GPU')
-    if len(gpus) > 1:
-        print(f"Using {len(gpus)} GPUs with MirroredStrategy")
+    # Use num_gpus from earlier detection (may be overridden via --num-gpus)
+    if num_gpus > 1:
+        print(f"Using {num_gpus} GPUs with MirroredStrategy")
         strategy = tf.distribute.MirroredStrategy()
         print(f"✓ MirroredStrategy initialized")
     else:
@@ -434,13 +771,10 @@ def main(args=None):
         print(f"Using single GPU or CPU")
     print()
 
-    # Build or load model within strategy scope
+    # Build model within strategy scope
     with strategy.scope():
-        if latest_checkpoint is not None:
-            print(f"Loading model from {latest_checkpoint}...")
-            model = tf.keras.models.load_model(latest_checkpoint)
-            print("✓ Checkpoint loaded successfully")
-        else:
+        if MODEL_TYPE == "transformer":
+            print("Building Transformer model...")
             model = build_transformer_model(
                 embedding_dim=EMBEDDING_DIM,
                 num_layers=NUM_LAYERS,
@@ -449,48 +783,48 @@ def main(args=None):
                 dropout=DROPOUT,
                 max_sequence_length=MAX_SEQUENCE_LENGTH,
                 fast=False,
-                verbose=True,
+                verbose=False,  # We'll build and show summary here instead
             )
-
-            # Custom loss function that handles NaN gracefully
-            def safe_mse_loss(y_true, y_pred):
-                """MSE loss with NaN protection."""
-                # Clip predictions to [0, 1] range
-                y_pred = tf.clip_by_value(y_pred, 0.0, 1.0)
-                # Replace any NaN in predictions with 0.5 (middle of range)
-                y_pred = tf.where(tf.math.is_nan(y_pred),
-                                  0.5 * tf.ones_like(y_pred), y_pred)
-                # Compute MSE manually: mean squared difference
-                squared_diff = tf.square(y_true - y_pred)
-                loss = tf.reduce_mean(squared_diff)
-                # Replace any NaN in loss with a large value (will trigger gradient clipping)
-                loss = tf.where(tf.math.is_nan(loss), 1e6 *
-                                tf.ones_like(loss), loss)
-                return loss
-
-            def safe_mae_metric(y_true, y_pred):
-                """MAE metric with NaN protection."""
-                y_pred = tf.clip_by_value(y_pred, 0.0, 1.0)
-                y_pred = tf.where(tf.math.is_nan(y_pred),
-                                  0.5 * tf.ones_like(y_pred), y_pred)
-                # Compute MAE manually: mean absolute difference
-                mae = tf.reduce_mean(tf.abs(y_true - y_pred))
-                mae = tf.where(tf.math.is_nan(mae), tf.zeros_like(mae), mae)
-                return mae
-
-            # Compile model with gradient clipping to prevent NaN
-            # Use clipnorm=1.0 to clip gradients by norm, preventing explosion
-            # Weight decay is configurable via --weight-decay argument
-            model.compile(
-                optimizer=tf.keras.optimizers.AdamW(
-                    learning_rate=SCALED_LR,
-                    weight_decay=WEIGHT_DECAY,  # Configurable, default 5e-4
-                    clipnorm=1.0  # Clip gradients to prevent explosion
-                ),
-                loss=safe_mse_loss,
-                metrics=[safe_mae_metric]
+        else:  # LSTM
+            print("Building LSTM model...")
+            model = build_lstm_model(
+                embedding_dim=EMBEDDING_DIM,
+                lstm_hidden_dim=LSTM_HIDDEN_DIM,
+                num_lstm_layers=NUM_LAYERS,
+                bidirectional=BIDIRECTIONAL,
+                dropout=DROPOUT,
+                feedforward_dim=FEEDFORWARD_DIM,
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+                fast=False,
+                verbose=False,  # We'll build and show summary here instead
             )
-            print(f"✓ Model compiled with learning rate {SCALED_LR:.2e}")
+        
+        # Build the model by calling it with sample data (proper way for subclassed models)
+        # This ensures all layers are properly initialized and shapes are computed
+        print("Building model with sample input...")
+        import numpy as np
+        sample_sequence = np.zeros((1, MAX_SEQUENCE_LENGTH, 13, 8, 8), dtype=np.float32)
+        sample_length = np.array([MAX_SEQUENCE_LENGTH], dtype=np.int32)
+        _ = model([sample_sequence, sample_length], training=False)
+        # Print model architecture using custom summary (handles subclassed models properly)
+        from src.models.transformer_tf import print_model_summary
+        print("\nModel Architecture:")
+        print_model_summary(model, MAX_SEQUENCE_LENGTH)
+        print()
+        
+        # Compile model with gradient clipping to prevent NaN
+        # Use clipnorm=1.0 to clip gradients by norm, preventing explosion
+        # Weight decay is configurable via --weight-decay argument
+        model.compile(
+            optimizer=tf.keras.optimizers.AdamW(
+                learning_rate=SCALED_LR,
+                weight_decay=WEIGHT_DECAY,  # Configurable, default 5e-4
+                clipnorm=1.0  # Clip gradients to prevent explosion
+            ),
+            loss=safe_mse_loss,
+            metrics=[safe_mae_metric]
+        )
+        print(f"✓ Model compiled with learning rate {SCALED_LR:.2e}")
 
     # For mixed precision, ensure output layer uses float32
     if USE_MIXED_PRECISION:
@@ -499,9 +833,13 @@ def main(args=None):
         if output_layer.dtype_policy.name != 'float32':
             print("Warning: Output layer should use float32 for numerical stability")
 
+    # Comprehensive metrics callback for rich visualizations
+    metrics_callback = ComprehensiveMetricsCallback(log_dir=RUN_DIR, log_file=log_file)
+    
     # Callbacks
     callbacks = [
         create_epoch_logger(log_every=1, log_file=log_file),
+        metrics_callback,  # Track detailed metrics for visualization
         # TensorBoard logging for visualization
         tf.keras.callbacks.TensorBoard(
             log_dir=str(RUN_DIR / "tensorboard"),
@@ -516,14 +854,6 @@ def main(args=None):
             filename=str(RUN_DIR / "metrics.csv"),
             separator=',',
             append=False,  # Overwrite if exists
-        ),
-        # Periodic checkpoint saving (every epoch)
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(
-                CHECKPOINT_DIR / f"{MODEL_PREFIX}_checkpoint_epoch-{{epoch:02d}}.keras"),
-            save_freq="epoch",
-            save_weights_only=False,
-            verbose=0,
         ),
         # Best model checkpoint
         tf.keras.callbacks.ModelCheckpoint(
@@ -580,148 +910,148 @@ def main(args=None):
             )
         )
 
-    remaining_epochs = EPOCHS - initial_epoch
-    if remaining_epochs <= 0:
-        print(f"Training already completed ({initial_epoch}/{EPOCHS} epochs)")
-        print("Using checkpointed model for export...")
+    final_loss = None
+    final_val = None
+    best_val = None
+    effective_batch = BATCH_SIZE * max(1, num_gpus)
+    print(
+        f"Starting training ({EPOCHS} epochs, "
+        f"batch={BATCH_SIZE} per GPU, effective={effective_batch}, "
+        f"val_split={VAL_SPLIT})"
+    )
+    mode = "preloaded (full shuffle)" if PRELOAD_DATA else f"streaming (shuffle={SHUFFLE_BUFFER:,})"
+    print(f"Data mode: {mode}")
+    print()
+
+    start_train = time.perf_counter()
+
+    # Suppress warnings about end-of-sequence and rendezvous cancellations (normal in multi-GPU training)
+    # These are harmless INFO messages from TensorFlow's multi-GPU coordination
+    import logging
+    import sys
+
+    # Suppress TensorFlow INFO and WARNING messages via logging
+    tf_logger = logging.getLogger('tensorflow')
+    old_level = tf_logger.level
+    tf_logger.setLevel(logging.ERROR)  # Only show ERROR and above
+
+    # Filter out specific rendezvous messages by redirecting stderr temporarily
+    # Note: These messages come from C++ code and bypass Python logging
+    class RendezvousFilter:
+        def __init__(self, original_stderr):
+            self.original_stderr = original_stderr
+            self.buffer = []
+
+        def write(self, text):
+            # Filter out "Local rendezvous" messages
+            if 'Local rendezvous' not in text and 'rendezvous' not in text.lower():
+                self.original_stderr.write(text)
+
+        def flush(self):
+            self.original_stderr.flush()
+
+    # Only filter if we're in multi-GPU mode (to avoid affecting single-GPU)
+    original_stderr = None
+    if num_gpus > 1:
+        original_stderr = sys.stderr
+        filtered_stderr = RendezvousFilter(original_stderr)
+        sys.stderr = filtered_stderr
+
+    # Calculate steps per epoch for repeating datasets
+    # When using .repeat(), we need to tell Keras how many steps = one epoch
+    # This prevents the "input ran out of data" warning
+    effective_batch_size = BATCH_SIZE * max(1, num_gpus)
+    
+    if USE_PARQUET:
+        # Use actual row counts from Parquet metadata
+        estimated_train_samples = total_train_rows
+        estimated_val_samples = total_val_rows
     else:
-        print(
-            f"Starting/resuming training ({remaining_epochs} epochs remaining, "
-            f"batch={BATCH_SIZE} per GPU, effective={BATCH_SIZE * len(tf.config.list_physical_devices('GPU'))}, "
-            f"val_split={VAL_SPLIT})"
+        # For pickle, we have exact counts
+        estimated_train_samples = len(train_games)
+        estimated_val_samples = len(val_games)
+    
+    # Apply sample limits if specified (for quick testing with large datasets)
+    MAX_TRAIN_SAMPLES = args.max_train_samples
+    MAX_VAL_SAMPLES = args.max_val_samples
+    
+    if MAX_TRAIN_SAMPLES and MAX_TRAIN_SAMPLES < estimated_train_samples:
+        log_print(f"Limiting training samples: {estimated_train_samples:,} -> {MAX_TRAIN_SAMPLES:,}")
+        estimated_train_samples = MAX_TRAIN_SAMPLES
+    
+    if MAX_VAL_SAMPLES and MAX_VAL_SAMPLES < estimated_val_samples:
+        log_print(f"Limiting validation samples: {estimated_val_samples:,} -> {MAX_VAL_SAMPLES:,}")
+        estimated_val_samples = MAX_VAL_SAMPLES
+    
+    steps_per_epoch = max(1, estimated_train_samples // effective_batch_size)
+    validation_steps = max(1, estimated_val_samples // effective_batch_size)
+    
+    log_print(f"Steps per epoch: {steps_per_epoch} (from {estimated_train_samples:,} samples)")
+    log_print(f"Validation steps: {validation_steps} (from {estimated_val_samples:,} samples)")
+    
+    try:
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            validation_steps=validation_steps,
+            verbose=1,
+            callbacks=callbacks,
         )
-        print("Using optimized streaming datasets with:")
-        print(f"  - Shuffle buffer: {SHUFFLE_BUFFER:,}")
-        print(f"  - Parallel data loading: {NUM_PARALLEL_CALLS}")
-        print(f"  - Mixed precision: {USE_MIXED_PRECISION}")
-        print()
+    finally:
+        # Restore logging level and stderr
+        tf_logger.setLevel(old_level)
+        if original_stderr is not None:
+            sys.stderr = original_stderr
+    train_secs = time.perf_counter() - start_train
+    print(
+        f"\n✓ Training completed in {train_secs/60:.2f} min ({train_secs/3600:.2f} hours)")
 
-        start_train = time.perf_counter()
+    final_loss = history.history["loss"][-1]
+    final_val = history.history.get("val_loss", [None])[-1]
+    print(
+        f"Final metrics -> loss={final_loss:.6f}, val_loss={final_val:.6f}")
 
-        # Suppress warnings about end-of-sequence and rendezvous cancellations (normal in multi-GPU training)
-        # These are harmless INFO messages from TensorFlow's multi-GPU coordination
-        import warnings
-        import logging
-        import sys
-
-        # Suppress TensorFlow INFO and WARNING messages via logging
-        tf_logger = logging.getLogger('tensorflow')
-        old_level = tf_logger.level
-        tf_logger.setLevel(logging.ERROR)  # Only show ERROR and above
-
-        # Filter out specific rendezvous messages by redirecting stderr temporarily
-        # Note: These messages come from C++ code and bypass Python logging
-        class RendezvousFilter:
-            def __init__(self, original_stderr):
-                self.original_stderr = original_stderr
-                self.buffer = []
-
-            def write(self, text):
-                # Filter out "Local rendezvous" messages
-                if 'Local rendezvous' not in text and 'rendezvous' not in text.lower():
-                    self.original_stderr.write(text)
-
-            def flush(self):
-                self.original_stderr.flush()
-
-        # Only filter if we're in multi-GPU mode (to avoid affecting single-GPU)
-        original_stderr = None
-        if len(tf.config.list_physical_devices('GPU')) > 1:
-            original_stderr = sys.stderr
-            filtered_stderr = RendezvousFilter(original_stderr)
-            sys.stderr = filtered_stderr
-
-        try:
-            history = model.fit(
-                train_dataset,
-                validation_data=val_dataset,
-                epochs=EPOCHS,
-                initial_epoch=initial_epoch,
-                verbose=1,
-                callbacks=callbacks,
-            )
-        finally:
-            # Restore logging level and stderr
-            tf_logger.setLevel(old_level)
-            if original_stderr is not None:
-                sys.stderr = original_stderr
-        train_secs = time.perf_counter() - start_train
+    # Convert loss to Elo estimates
+    if final_val is not None:
+        rmse_normalized = np.sqrt(final_val)
+        rmse_elo = rmse_normalized * 2000  # Rough estimate
         print(
-            f"\n✓ Training completed in {train_secs/60:.2f} min ({train_secs/3600:.2f} hours)")
+            f"Final validation -> RMSE (normalized): {rmse_normalized:.6f}, Est. RMSE (Elo): {rmse_elo:.1f}")
 
-        final_loss = history.history["loss"][-1]
-        final_val = history.history.get("val_loss", [None])[-1]
+    if "val_loss" in history.history:
+        best_val_idx = int(np.argmin(history.history["val_loss"]))
+        best_val = history.history["val_loss"][best_val_idx]
+        best_loss = history.history["loss"][best_val_idx]
+        best_rmse_normalized = np.sqrt(best_val)
+        best_rmse_elo = best_rmse_normalized * 2000
         print(
-            f"Final metrics -> loss={final_loss:.6f}, val_loss={final_val:.6f}")
+            f"Best epoch (by val_loss): {best_val_idx + 1}/{len(history.history['loss'])} "
+            f"loss={best_loss:.6f}, val_loss={best_val:.6f}"
+        )
+        print(
+            f"Best validation -> RMSE (normalized): {best_rmse_normalized:.6f}, Est. RMSE (Elo): {best_rmse_elo:.1f}")
 
-        # Convert loss to Elo estimates
-        if final_val is not None:
-            rmse_normalized = np.sqrt(final_val)
-            rmse_elo = rmse_normalized * 2000  # Rough estimate
-            print(
-                f"Final validation -> RMSE (normalized): {rmse_normalized:.6f}, Est. RMSE (Elo): {rmse_elo:.1f}")
-
-        if "val_loss" in history.history:
-            best_val_idx = int(np.argmin(history.history["val_loss"]))
-            best_val = history.history["val_loss"][best_val_idx]
-            best_loss = history.history["loss"][best_val_idx]
-            best_rmse_normalized = np.sqrt(best_val)
-            best_rmse_elo = best_rmse_normalized * 2000
-            print(
-                f"Best epoch (by val_loss): {best_val_idx + 1}/{len(history.history['loss'])} "
-                f"loss={best_loss:.6f}, val_loss={best_val:.6f}"
-            )
-            print(
-                f"Best validation -> RMSE (normalized): {best_rmse_normalized:.6f}, Est. RMSE (Elo): {best_rmse_elo:.1f}")
+    # Evaluate on validation set to provide an objective metric (useful for tuning)
+    try:
+        eval_results = model.evaluate(
+            val_dataset,
+            steps=validation_steps,
+            verbose=0,
+        )
+        eval_val_loss = float(eval_results[0]) if isinstance(eval_results, (list, tuple)) else float(eval_results)
+        if best_val is None or eval_val_loss < best_val:
+            best_val = eval_val_loss
+        print(f"✓ Validation eval after training: val_loss={eval_val_loss:.6f}")
+    except Exception as e:
+        print(f"Warning: validation evaluation failed: {e}")
+        eval_val_loss = None
 
     # Save final model
     final_keras_path = f"{MODEL_PREFIX}.keras"
     model.save(final_keras_path)
     print(f"✓ Saved model to {final_keras_path}")
-
-    # Export to TFLite (optional - may fail with LayerNormalization)
-    # Note: TFLite has limited support for some Keras layers, particularly LayerNormalization
-    # This is a known limitation and doesn't affect training or inference with the .keras model
-    print("\nAttempting TFLite export (this may fail with transformer models due to LayerNormalization)...")
-    try:
-        # Try converting to TFLite
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
-
-        # Set converter options to be more permissive
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,  # Enable TensorFlow Lite ops
-            tf.lite.OpsSet.SELECT_TF_OPS,    # Enable TensorFlow ops (fallback)
-        ]
-        converter._experimental_lower_tensor_list_ops = False
-
-        tflite_float = converter.convert()
-        float_path = Path(f"{MODEL_PREFIX}.tflite")
-        float_path.write_bytes(tflite_float)
-        log_print(f"✓ Saved TFLite (float32) to {float_path}")
-
-        # Try int8 quantization (may also fail)
-        try:
-            converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            tflite_int8 = converter.convert()
-            int8_path = Path(f"{MODEL_PREFIX}_int8.tflite")
-            int8_path.write_bytes(tflite_int8)
-            log_print(f"✓ Saved TFLite (dynamic range int8) to {int8_path}")
-        except Exception as e2:
-            log_print(
-                f"Note: Int8 quantization failed (this is optional): {e2}")
-
-    except Exception as e:
-        log_print(f"⚠ TFLite export failed: {e}")
-        log_print(
-            "  This is a known limitation with transformer models using LayerNormalization.")
-        log_print(
-            "  The .keras model works fine for inference - TFLite is only needed for mobile/edge deployment.")
-        log_print("  If you need TFLite, consider:")
-        log_print(
-            "    1. Using SavedModel format instead: model.save('model_savedmodel', save_format='tf')")
-        log_print("    2. Using TensorFlow Serving for deployment")
-        log_print(
-            "    3. Replacing LayerNormalization with BatchNormalization (may affect performance)")
 
     # Export to TensorRT (optional, for GPU inference optimization)
     if TENSORRT_AVAILABLE:
@@ -729,7 +1059,8 @@ def main(args=None):
             print("\nExporting to TensorRT for optimized GPU inference...")
             # TensorRT conversion requires a saved model format
             saved_model_path = f"{MODEL_PREFIX}_saved_model"
-            model.save(saved_model_path, save_format='tf')
+            # Keras 3: use tf.saved_model.save instead of deprecated save_format arg
+            tf.saved_model.save(model, saved_model_path)
 
             # Convert to TensorRT using TensorFlow's TensorRT integration
             # Note: This requires TensorRT to be properly installed with CUDA
@@ -766,6 +1097,16 @@ def main(args=None):
     print(f"\nTo view TensorBoard, run:")
     print(f"  tensorboard --logdir {RUN_DIR / 'tensorboard'}")
     print(f"{'='*60}")
+
+    # Return metrics for programmatic use (e.g., hyperparameter tuning)
+    return {
+        "final_loss": final_loss,
+        "final_val_loss": final_val,
+        "best_val_loss": best_val,
+        "eval_val_loss": eval_val_loss,
+        "model_prefix": MODEL_PREFIX,
+        "run_dir": str(RUN_DIR),
+    }
 
 
 if __name__ == "__main__":

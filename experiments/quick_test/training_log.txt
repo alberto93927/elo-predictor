@@ -1,2 +1,4 @@
 Epoch   0 | Train MAE: 0.081552 | Val MAE: 0.081105
 Epoch   1 | Train MAE: 0.081064 | Val MAE: 0.080164
+Epoch   0 | Train MAE: 0.081595 | Val MAE: 0.081057
+Epoch   1 | Train MAE: 0.080999 | Val MAE: 0.079900

@@ -145,14 +145,33 @@ def parquet_row_group_generator(parquet_path, row_group_indices, encoder: FENEnc
             sequences = []
             valid_lengths = []
             valid_targets = []
+            opponent_elos = []
+            elo_differences = []
+            game_results = []
+            
+            # Check if opponent features exist (for backward compatibility)
+            has_opponent_features = all(col in df.columns for col in ['opponent_elo', 'elo_difference', 'game_result'])
             
             # Get the expected shape from encoder
             max_seq_len = encoder.max_sequence_length
             seq_shape = (max_seq_len, encoder.board_channels, 8, 8)
             flat_size = max_seq_len * encoder.board_channels * 8 * 8
             
-            for idx, (seq_flat, length, elo) in enumerate(zip(df['sequence_flat'], df['length'], df['elo'])):
+            # Prepare iterator based on whether opponent features exist
+            if has_opponent_features:
+                data_iter = zip(df['sequence_flat'], df['length'], df['elo'], 
+                               df['opponent_elo'], df['elo_difference'], df['game_result'])
+            else:
+                data_iter = zip(df['sequence_flat'], df['length'], df['elo'])
+            
+            for idx, row_data in enumerate(data_iter):
                 try:
+                    if has_opponent_features:
+                        seq_flat, length, elo, opp_elo, elo_diff, result = row_data
+                    else:
+                        seq_flat, length, elo = row_data
+                        opp_elo, elo_diff, result = None, None, None
+                    
                     # Convert to numpy array
                     if isinstance(seq_flat, list):
                         seq_flat = np.array(seq_flat, dtype=np.float32)
@@ -181,6 +200,17 @@ def parquet_row_group_generator(parquet_path, row_group_indices, encoder: FENEnc
                         # Raw ELO detected, normalize it
                         elo_float = encoder.normalize_elo(int(elo_float))
                     valid_targets.append(elo_float)
+                    
+                    # Handle opponent features (use defaults if not present)
+                    if has_opponent_features:
+                        opponent_elos.append(float(opp_elo))
+                        elo_differences.append(float(elo_diff))
+                        game_results.append(float(result))
+                    else:
+                        # Default values for backward compatibility
+                        opponent_elos.append(0.5)  # Middle of normalized range
+                        elo_differences.append(0.0)  # No difference
+                        game_results.append(0.5)  # Draw
                 except Exception as e:
                     print(f"Warning: Skipping row {idx}: {e}")
                     continue
@@ -189,7 +219,11 @@ def parquet_row_group_generator(parquet_path, row_group_indices, encoder: FENEnc
             sequences = []
             valid_lengths = []
             valid_targets = []
+            opponent_elos = []
+            elo_differences = []
+            game_results = []
             
+            # Old format doesn't have opponent features, use defaults
             for idx, (fen_seq, length, elo) in enumerate(zip(df['fen_sequence'], df['length'], df['elo'])):
                 try:
                     # Encode FEN sequence on-the-fly
@@ -215,6 +249,11 @@ def parquet_row_group_generator(parquet_path, row_group_indices, encoder: FENEnc
                         # Raw ELO detected, normalize it
                         elo_float = encoder.normalize_elo(int(elo_float))
                     valid_targets.append(elo_float)
+                    
+                    # Default values for old format
+                    opponent_elos.append(0.5)
+                    elo_differences.append(0.0)
+                    game_results.append(0.5)
                 except Exception as e:
                     print(f"Warning: Skipping row {idx}: {e}")
                     continue
@@ -233,11 +272,18 @@ def parquet_row_group_generator(parquet_path, row_group_indices, encoder: FENEnc
         lengths = np.array(valid_lengths, dtype=np.int32)
         targets = np.array(valid_targets, dtype=np.float32).reshape(-1, 1)
         
+        # Stack opponent features
+        opponent_features = np.stack([
+            np.array(opponent_elos, dtype=np.float32),
+            np.array(elo_differences, dtype=np.float32),
+            np.array(game_results, dtype=np.float32)
+        ], axis=1)  # Shape: (batch_size, 3)
+        
         # Clip targets to [0, 1] range to prevent NaN from out-of-range values
         # This is a safety measure in case normalization wasn't applied correctly
         targets = np.clip(targets, 0.0, 1.0)
         
-        yield (sequences, lengths, targets)
+        yield (sequences, lengths, targets, opponent_features)
 
 
 def create_streaming_dataset(
@@ -247,6 +293,7 @@ def create_streaming_dataset(
     shuffle_buffer: Optional[int] = None,
     num_parallel_calls: Optional[int] = None,
     max_sequence_length: int = 200,
+    drop_remainder: bool = True,
 ):
     """
     Create an optimized tf.data.Dataset that streams from Parquet row groups.
@@ -273,7 +320,7 @@ def create_streaming_dataset(
         """Generator that loads all samples from all row groups sequentially."""
         for rg_idx in row_group_indices:
             try:
-                for sequences, lengths, targets in parquet_row_group_generator(
+                for sequences, lengths, targets, opponent_features in parquet_row_group_generator(
                     parquet_path_str, [rg_idx], encoder
                 ):
                     # Yield individual samples with correct dtypes at source
@@ -285,9 +332,13 @@ def create_streaming_dataset(
                         # Ensure sequence is float32
                         seq = sequences[i].astype(np.float32)
                         
+                        # Extract opponent features for this sample
+                        opp_features = opponent_features[i].astype(np.float32)  # Shape: (3,)
+                        
                         yield {
                             "sequence": seq,
                             "length": length_int,  # Python int -> TensorFlow int32
+                            "opponent_features": opp_features,  # Shape: (3,)
                         }, targets[i].astype(np.float32)
             except Exception as e:
                 # Skip problematic row groups
@@ -305,17 +356,28 @@ def create_streaming_dataset(
                     dtype=tf.float32
                 ),
                 "length": tf.TensorSpec(shape=(), dtype=tf.int32),
+                "opponent_features": tf.TensorSpec(shape=(3,), dtype=tf.float32),
             },
             tf.TensorSpec(shape=(1,), dtype=tf.float32),
         ),
     )
     
     # Shuffle if requested
+    # Note: We don't use .cache() here because with steps_per_epoch limiting 
+    # how much data is read, the cache would be discarded each epoch.
+    # For large streaming datasets, the shuffle buffer provides sufficient mixing.
     if shuffle_buffer is not None and shuffle_buffer > 0:
         dataset = dataset.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
     
     # Batch and prefetch
-    dataset = dataset.batch(batch_size, drop_remainder=False)
+    # Use drop_remainder=True for multi-GPU to ensure identical batch shapes across replicas
+    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
+    
+    # CRITICAL: Repeat dataset for training (allows multiple epochs)
+    # For training datasets, we need to repeat so the generator can cycle through epochs
+    # For validation, we typically don't repeat, but Keras will handle that
+    # We'll add a parameter to control this, but default to repeating for training
+    dataset = dataset.repeat()  # Repeat indefinitely - Keras will stop at the right time
     
     # Configure dataset options to handle end-of-sequence gracefully
     # This reduces warnings in multi-GPU training
@@ -330,11 +392,159 @@ def create_streaming_dataset(
         length = x['length']
         # Convert via float32 to handle float16 properly
         x['length'] = tf.cast(tf.cast(length, tf.float32), tf.int32)
+        # Ensure opponent_features stays float32
+        x['opponent_features'] = tf.cast(x['opponent_features'], tf.float32)
         return x, y
     
     dataset = dataset.map(ensure_int32_length, num_parallel_calls=tf.data.AUTOTUNE)
     # Aggressive prefetching: prefetch multiple batches to keep GPU fed
     # Prefetch 4-8 batches ahead to prevent GPU starvation
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
+
+
+def preload_parquet_to_memory(
+    parquet_path: Path,
+    row_group_indices: List[int],
+    encoder: FENEncoder,
+    max_samples: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pre-load data from Parquet into NumPy arrays in memory.
+    
+    This is much faster for training when you have sufficient RAM,
+    as it eliminates all I/O during training epochs.
+    
+    Args:
+        parquet_path: Path to Parquet file
+        row_group_indices: List of row group indices to load
+        encoder: FENEncoder instance
+        max_samples: Maximum samples to load (0 = unlimited)
+        
+    Returns:
+        Tuple of (sequences, lengths, targets, opponent_features) as NumPy arrays
+        - sequences: (N, max_seq_len, 13, 8, 8) float32
+        - lengths: (N,) int32
+        - targets: (N, 1) float32
+        - opponent_features: (N, 3) float32
+    """
+    import time
+    start_time = time.time()
+    
+    # Collect data from generator
+    all_sequences = []
+    all_lengths = []
+    all_targets = []
+    all_opponent_features = []
+    
+    total_samples = 0
+    for sequences, lengths, targets, opponent_features in parquet_row_group_generator(
+        parquet_path, row_group_indices, encoder
+    ):
+        all_sequences.append(sequences)
+        all_lengths.append(lengths)
+        all_targets.append(targets)
+        all_opponent_features.append(opponent_features)
+        total_samples += len(sequences)
+        
+        # Stop early if we've hit the limit
+        if max_samples > 0 and total_samples >= max_samples:
+            break
+    
+    # Concatenate all arrays
+    sequences = np.concatenate(all_sequences, axis=0)
+    lengths = np.concatenate(all_lengths, axis=0)
+    targets = np.concatenate(all_targets, axis=0)
+    opponent_features = np.concatenate(all_opponent_features, axis=0)
+    
+    # Truncate to max_samples if needed
+    if max_samples > 0 and len(sequences) > max_samples:
+        sequences = sequences[:max_samples]
+        lengths = lengths[:max_samples]
+        targets = targets[:max_samples]
+        opponent_features = opponent_features[:max_samples]
+    
+    # Calculate memory usage
+    memory_gb = (
+        sequences.nbytes + lengths.nbytes + targets.nbytes + opponent_features.nbytes
+    ) / (1024 ** 3)
+    
+    elapsed = time.time() - start_time
+    truncated = " (truncated)" if max_samples > 0 and total_samples > max_samples else ""
+    print(f"✓ {len(sequences):,} samples in {elapsed:.1f}s ({memory_gb:.1f} GB){truncated}")
+    
+    return sequences, lengths, targets, opponent_features
+
+
+def create_preloaded_dataset(
+    sequences: np.ndarray,
+    lengths: np.ndarray,
+    targets: np.ndarray,
+    opponent_features: np.ndarray,
+    batch_size: int,
+    shuffle: bool = True,
+    drop_remainder: bool = True,
+) -> tf.data.Dataset:
+    """
+    Create tf.data.Dataset from pre-loaded NumPy arrays.
+    
+    This is the fastest approach when data fits in memory:
+    - No I/O during training
+    - No generator overhead
+    - Full-dataset shuffle (not just buffer-based)
+    
+    Args:
+        sequences: (N, max_seq_len, 13, 8, 8) float32 array
+        lengths: (N,) int32 array
+        targets: (N, 1) float32 array
+        opponent_features: (N, 3) float32 array
+        batch_size: Batch size for training
+        shuffle: Whether to shuffle (uses full dataset shuffle)
+        drop_remainder: Whether to drop incomplete final batch
+        
+    Returns:
+        tf.data.Dataset ready for training
+    """
+    n_samples = len(sequences)
+    
+    # Create dataset from tensor slices (much faster than from_generator)
+    dataset = tf.data.Dataset.from_tensor_slices((
+        {
+            "sequence": sequences,
+            "length": lengths,
+            "opponent_features": opponent_features,
+        },
+        targets,
+    ))
+    
+    # Full-dataset shuffle (much better than buffer-based shuffle)
+    if shuffle:
+        dataset = dataset.shuffle(
+            buffer_size=n_samples,  # Full shuffle!
+            reshuffle_each_iteration=True
+        )
+    
+    # Batch
+    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
+    
+    # Repeat for multiple epochs
+    dataset = dataset.repeat()
+    
+    # Configure options for multi-GPU
+    options = tf.data.Options()
+    options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    dataset = dataset.with_options(options)
+    
+    # Ensure correct dtypes
+    def ensure_dtypes(x, y):
+        x['length'] = tf.cast(x['length'], tf.int32)
+        x['opponent_features'] = tf.cast(x['opponent_features'], tf.float32)
+        return x, y
+    
+    dataset = dataset.map(ensure_dtypes, num_parallel_calls=tf.data.AUTOTUNE)
+    
+    # Prefetch for optimal GPU utilization
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
     return dataset
@@ -374,16 +584,51 @@ def create_dataset_from_pickle(
             else:
                 sequence_np = np.array(sequence)
             
-            # Select target Elo
-            target_elo = white_elo if use_white_elo else black_elo
+            # Select target Elo and opponent Elo
+            if use_white_elo:
+                target_elo = white_elo
+                opponent_elo = black_elo
+            else:
+                target_elo = black_elo
+                opponent_elo = white_elo
+            
             normalized_elo = encoder.normalize_elo(target_elo)
+            normalized_opponent_elo = encoder.normalize_elo(opponent_elo)
+            
+            # Calculate Elo difference (normalized)
+            elo_diff = target_elo - opponent_elo
+            normalized_elo_diff = np.clip(elo_diff / 1000.0, -1.0, 1.0)
+            
+            # Encode game result from player's perspective
+            if use_white_elo:
+                if result == '1-0':
+                    result_encoded = 1.0
+                elif result == '0-1':
+                    result_encoded = 0.0
+                else:  # '1/2-1/2'
+                    result_encoded = 0.5
+            else:
+                if result == '0-1':
+                    result_encoded = 1.0
+                elif result == '1-0':
+                    result_encoded = 0.0
+                else:  # '1/2-1/2'
+                    result_encoded = 0.5
             
             # Ensure length is a Python int, not numpy scalar
             length_int = int(length)
             
+            # Create opponent features array
+            opponent_features = np.array([
+                normalized_opponent_elo,
+                normalized_elo_diff,
+                result_encoded
+            ], dtype=np.float32)
+            
             yield {
                 "sequence": sequence_np.astype(np.float32),
                 "length": length_int,  # Python int, will be converted to int32 by TensorFlow
+                "opponent_features": opponent_features,
             }, np.array([normalized_elo], dtype=np.float32)
     
     dataset = tf.data.Dataset.from_generator(
@@ -395,6 +640,7 @@ def create_dataset_from_pickle(
                     dtype=tf.float32
                 ),
                 "length": tf.TensorSpec(shape=(), dtype=tf.int32),
+                "opponent_features": tf.TensorSpec(shape=(3,), dtype=tf.float32),
             },
             tf.TensorSpec(shape=(1,), dtype=tf.float32),
         ),
@@ -403,13 +649,21 @@ def create_dataset_from_pickle(
     if shuffle:
         dataset = dataset.shuffle(min(len(games), 10000), reshuffle_each_iteration=True)
     
-    dataset = dataset.batch(batch_size)
+    # Use drop_remainder=True to ensure consistent batch shapes across replicas
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    
+    # CRITICAL: Repeat dataset for training (allows multiple epochs)
+    # For training datasets, we need to repeat so the generator can cycle through epochs
+    # For validation, we typically don't repeat, but Keras will handle that
+    dataset = dataset.repeat()  # Repeat indefinitely - Keras will stop at the right time
     
     # CRITICAL: After batching, mixed precision might convert length to float16
     # Force it back to int32 - this is the source fix
     def fix_length_dtype(x, y):
         # Convert length from any dtype (including float16) back to int32
         x['length'] = tf.cast(x['length'], tf.int32)
+        # Ensure opponent_features stays float32
+        x['opponent_features'] = tf.cast(x['opponent_features'], tf.float32)
         return x, y
     
     # Apply the fix immediately after batching
